@@ -1,0 +1,199 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watcher
+  labels:
+    app: watcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: watcher
+  template:
+    metadata:
+      labels:
+        app: watcher
+    spec:
+      serviceAccountName: watcher-sa
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 1000
+
+      volumes:
+      # Vault Authentication AppRole info
+      - name: watcher-bao-approle
+        projected:
+          sources:
+          - secret:
+              name: watcher-bao-approle
+              items:
+              - key: role-id
+                path: role-id
+              - key: secret-id
+                path: secret-id
+      - name: watcher-bao-agent-config
+        configMap:
+          name: watcher-bao-agent-config
+          items:
+            - key: agent.hcl
+              path: agent.hcl
+      - name: watcher-bao-token
+        emptyDir: {}
+      - name: pulsar-bao-approle
+        secret:
+          secretName: pulsar-bao-approle
+          items:
+            - key: role-id
+              path: role-id
+            - key: secret-id
+              path: secret-id
+      - name: pulsar-bao-agent-config
+        configMap:
+          name: pulsar-bao-agent-config
+          items:
+            - key: agent.hcl
+              path: agent.hcl
+      - name: pulsar-bao-token
+        emptyDir: {}
+      - name: pulsar-bao-agent-cache
+        emptyDir:
+          sizeLimit: "50Mi"
+      - name: watcher-bao-agent-cache
+        emptyDir:
+          sizeLimit: "50Mi"
+
+      # CA bundle for client Vault TLS connection (Vault Agent uses)
+      - name: openbao-ca
+        projected:
+          sources:
+          - secret:
+              name: openbao-ca-secret
+              items:
+              - key: ca.crt
+                path: ca.crt
+
+      - name: pulsar-ca
+        emptyDir: {}
+#        secret:
+#          secretName: pulsar-ca-secret 
+#          items:
+#          - key: ca.crt
+#            path: ca.crt 
+  
+      - name: proxy-certs
+        secret:
+          secretName: "watcher-tls-credential"
+          items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+      - name: watcher-config
+        configMap:
+          name: watcher-config
+      - name: avro-schemas
+        configMap:
+          name: avro-schemas 
+      - name: client-certs
+        emptyDir: {}
+
+      containers:
+      - name: watcher-bao-agent
+        image: openbao/openbao:latest  
+        imagePullPolicy: IfNotPresent
+
+        # Vault Agent runs as non-root
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+
+        volumeMounts:
+        - name: watcher-bao-approle
+          mountPath: /etc/bao/watcher        # contains role-id & secret-id
+
+        - name: watcher-bao-agent-config
+          mountPath: /etc/bao-agent   # contains agent.hcl
+          readOnly: true
+
+        - name: openbao-ca
+          mountPath: /etc/bao/ca
+          readOnly: true
+
+        - name: watcher-bao-token
+          mountPath: /home/bao/watcher        # agent writes token here
+
+        - name: watcher-bao-agent-cache
+          mountPath: /home/bao/watcher/cache  # cache persistence directory
+
+        command: ["bao", "agent", "-config=/etc/bao-agent/agent.hcl"]
+        env:
+        - name: VAULT_LOG_LEVEL
+          value: "info"
+
+      - name: pulsar-vault-agent
+        image: openbao/openbao:latest
+        imagePullPolicy: IfNotPresent
+
+        # Bao Agent runs as non-root
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+
+        volumeMounts:
+        - name: pulsar-bao-approle
+          mountPath: /etc/bao/pulsar
+        - name: pulsar-bao-token
+          mountPath: /home/bao/pulsar
+        - name: pulsar-bao-agent-config
+          mountPath: /etc/bao-agent
+        - name: openbao-ca
+          mountPath: /etc/bao/ca
+        - name: pulsar-bao-agent-cache
+          mountPath: /home/bao/pulsar/cache  # cache persistence directory
+
+        command: ["bao", "agent", "-config=/etc/bao-agent/agent.hcl"]
+
+      - name: watcher
+        image: library/watcher:1.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: watcher-config
+          mountPath: /app/config
+          readOnly: true
+        - name: pulsar-ca
+          mountPath: "/app/certs/pulsar"
+        - name: proxy-certs
+          mountPath: "/app/certs/proxy"
+        - name: avro-schemas
+          mountPath: "/app/avro-schemas"
+          readOnly: true
+        - name: client-certs
+          mountPath: "/app/certs/client"
+        - name: watcher-bao-approle
+          mountPath: "/app/bao/watcher"
+        - name: watcher-bao-token
+          mountPath: /home/bao/watcher
+        - name: pulsar-bao-approle
+          mountPath: "/app/bao/pulsar"
+        - name: pulsar-bao-token
+          mountPath: /home/bao/pulsar

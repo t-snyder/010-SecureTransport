@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bao-agent-config
+data:
+  agent.hcl: |
+    ## Agent-wide settings
+    exit_after_auth = false
+    pid_file       = "/home/bao/pidfile"
+
+    ## How to talk to Vault Server through Istio Gateway with TLS termination
+    ## For cross-cluster access via port-forward to host IP
+    vault {
+      # Point at the host IP with port-forward (e.g., kubectl port-forward --address=0.0.0.0 -n istio-system svc/vault-gateway 8443:443)
+      # Replace 192.168.1.100 with your actual host IP
+      address = "https://openbao.openbao.svc.cluster.local:8200"
+
+      # Trust the cert-manager generated CA for Gateway's TLS certificate
+      tls_ca_file   = "/etc/bao/ca/ca.crt"
+
+      # Since we're accessing via IP instead of hostname, we need to skip hostname verification
+      # The certificate is issued for vault.local, not the IP address
+      tls_skip_verify = true
+
+      # Alternative: Use server_name for SNI if you want to keep hostname verification
+      # tls_server_name = "vault.local"
+      # tls_skip_verify = false
+
+      # Optional: Configure retry behavior for Gateway connection
+      retry {
+        num_retries = 5
+        initial_backoff = "5s"
+        max_backoff = "30s"
+      }
+    }
+
+    auto_auth {
+      method "approle" {
+        mount_path = "auth/approle"
+        config = {
+          role_id_file_path        = "/etc/bao/role-id"
+          secret_id_file_path      = "/etc/bao/secret-id"
+          remove_secret_id_file_after_reading = false 
+          secret_id_refresh_interval = "10s"
+        }
+      }
+
+      sink "file" {
+        config = {
+          path = "/home/bao/token"
+          mode = 0640
+        }
+      }
+    }
+
+    # Enable caching for better performance
+    cache {
+      # Optional: Enable persistent cache across restarts
+      persist = {
+        type = "kubernetes"
+        path = "/home/bao/cache"
+      }
+    }
+
+    # Listener for metadata-svc to connect to Agent
+    listener "tcp" {
+      address     = "0.0.0.0:8100"
+      tls_disable = true
+    }
+    
+    # API proxy configuration
+    api_proxy {
+      use_auto_auth_token = true
+    }
+
+    # Optional: Add telemetry for monitoring
+    telemetry {
+      prometheus_retention_time = "10m"
+      disable_hostname = true
+    }
+
+    # Logging configuration
+    log_level = "info"
+    log_format = "json"

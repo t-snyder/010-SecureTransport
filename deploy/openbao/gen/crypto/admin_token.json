@@ -1,0 +1,27 @@
+{
+  "request_id": "759f13df-8b10-3328-7eac-8579400be6cf",
+  "lease_id": "",
+  "lease_duration": 0,
+  "renewable": false,
+  "data": null,
+  "warnings": null,
+  "auth": {
+    "client_token": "s.rVXUSvdzhfw5aLVieGmbneCv",
+    "accessor": "wq2XQfylRf0sQseU57R8K77d",
+    "policies": [
+      "admin",
+      "default"
+    ],
+    "token_policies": [
+      "admin",
+      "default"
+    ],
+    "identity_policies": null,
+    "metadata": null,
+    "orphan": false,
+    "entity_id": "",
+    "lease_duration": 2764800,
+    "renewable": true,
+    "mfa_requirement": null
+  }
+}

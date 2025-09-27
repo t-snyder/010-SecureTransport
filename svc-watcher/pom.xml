@@ -1,0 +1,149 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.8620af4c-6343-425c-82d2-41b7b148dd81</groupId>
+  <artifactId>svc-watcher</artifactId>
+  <version>0.1</version>
+  
+  <properties>
+    <!-- Encoding -->
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    
+    <!-- Version properties -->
+    <vertx.version>5.0.0</vertx.version>
+    <fabric8.version>7.3.1</fabric8.version>
+    <pulsar.client.version>4.0.4</pulsar.client.version>
+    <cassandra.driver.version>4.19.0</cassandra.driver.version>
+    <jackson.version>2.18.2</jackson.version>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
+  </properties>
+
+  <dependencies>
+   <dependency>
+      <groupId>org.8620af4c-6343-425c-82d2-41b7b148dd81</groupId>
+      <artifactId>svc-core</artifactId>
+      <version>0.1</version>
+    </dependency>
+
+     <dependency>
+      <groupId>io.fabric8</groupId>
+      <artifactId>kubernetes-client</artifactId>
+      <version>${fabric8.version}</version>
+      <exclusions>
+        <!-- Exclude Vert.x HTTP client to avoid conflicts -->
+        <exclusion>
+          <groupId>io.fabric8</groupId>
+          <artifactId>kubernetes-httpclient-vertx</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <!-- Explicitly include OkHttp-based client -->
+    <dependency>
+      <groupId>io.fabric8</groupId>
+      <artifactId>kubernetes-httpclient-okhttp</artifactId>
+      <version>${fabric8.version}</version>
+    </dependency>
+
+    <!-- Vert.x Core -->
+    <dependency>
+      <groupId>io.vertx</groupId>
+      <artifactId>vertx-core</artifactId>
+      <version>${vertx.version}</version>
+    </dependency>
+ 
+    <dependency>
+      <groupId>io.vertx</groupId>
+      <artifactId>vertx-config</artifactId>
+      <version>${vertx.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.nats</groupId>
+      <artifactId>jnats</artifactId>
+      <version>2.22.0</version>
+    </dependency> 
+   
+    <dependency>
+      <groupId>org.apache.cassandra</groupId>
+      <artifactId>java-driver-core</artifactId>
+      <version>${cassandra.driver.version}</version>
+    </dependency>
+  
+    <dependency>
+      <groupId>org.apache.cassandra</groupId>
+      <artifactId>java-driver-query-builder</artifactId>
+      <version>${cassandra.driver.version}</version>
+    </dependency>
+   
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-annotations</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    
+    <!-- SLF4J Binding for logging (optional) -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>1.7.36</version>
+    </dependency>
+    
+        <!-- TestNG -->
+    <dependency>
+      <groupId>org.testng</groupId>
+      <artifactId>testng</artifactId>
+      <version>7.11.0</version>
+      <scope>test</scope>
+    </dependency>
+
+  </dependencies>
+  
+  <build>
+    <finalName>watcher-0.1</finalName>
+    <plugins>
+      <!-- Maven Compiler Plugin -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+          <configuration>
+          <source>${maven.compiler.source}</source>
+          <target>${maven.compiler.target}</target>
+          <encoding>${project.build.sourceEncoding}</encoding>
+        </configuration>
+      </plugin>
+      <!-- Vert.x Maven Plugin for creating a fat jar -->
+      <plugin>
+        <groupId>io.reactiverse</groupId>
+        <artifactId>vertx-maven-plugin</artifactId>
+        <version>2.0.1</version>
+        <executions>
+          <execution>
+            <goals>
+              <goal>package</goal>
+            </goals>
+          </execution>
+        </executions>
+        <configuration>
+          <redeploy>false</redeploy>
+          <launcher>service.WatcherServiceMain</launcher>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+    
+</project>

@@ -1,0 +1,28 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: metadata-nats-credential
+  namespace: metadata 
+spec:
+  isCA: false
+  duration: "6h"
+  renewBefore: "3h"
+  subject:
+    organizations:
+    - metadata
+  privateKey:
+    algorithm: RSA
+    size: 4096
+    rotationPolicy: Always
+  commonName: metadata
+  dnsNames:
+    - localhost
+    - metadata
+    - metadata-service
+    - metadata-service.metadata.svc.cluster.local
+  ipAddresses:
+    - 127.0.0.1
+    - 10.1.1.12
+  secretName: metadata-nats-credential
+  issuerRef:
+    name: metadata-tls-issuer

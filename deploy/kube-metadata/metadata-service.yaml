@@ -1,0 +1,15 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metadata-svc
+  labels:
+    app: metadata-svc
+spec:
+  selector:
+    app: metadata-svc
+  ports:
+  - port: 443
+    targetPort: 443
+    name: http
+  type: ClusterIP

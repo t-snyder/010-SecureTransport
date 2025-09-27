@@ -1,0 +1,48 @@
+{
+  "kubeClusterName": "vault",
+  "serviceId":       "metadata",
+  "environment":     "testing",
+  
+  "nats": 
+  {
+    "natsUseTLS":     "true",
+    "natsUrl":        "tls://nats.nats.svc.cluster.local:4222",
+    "tlsSecret":      "metadata-nats-client-tls",   
+    "caCertFilePath": "/app/certs/nats/ca.crt",
+    "clientCertPath": "/app/certs/client/"
+  },
+  
+  "vault":
+  {
+    "vaultagentAddr":     "http://127.0.0.1:8100",
+    "vaultAgentHost":     "127.0.0.1",
+    "vaultAgentPort":     "8100",
+    "appRoleSecretName":  "metadata-bao-approle",
+    "appRoleName":        "metadata",
+    "appRoleTokenPath":   "/home/bao/token",
+    "secretIDRotationMs": "300000"
+  },
+  
+  "keyExchange":
+  {
+    "keyRotationMinutes":  "240",
+    "svcKeyExchStreamBase": "METADATA_KEY_EXCHANGE",
+    "svcKeyExchSubjectBase": "metadata.key-exchange.svc-",
+    "expiryMinutes":       "360",
+    "consumerSubjectSvcId":  "metadata",
+    "producerSubjectSvcIds": [ "watcher", "tester" ]
+  },
+  
+  "servicesACL":
+  {
+    "aclConfigMapName": "nats-acl",
+    "aclNamespace":     "metadata",
+    "encKeyExpiry":     "8",
+    "rotatePriorHours": "5"
+  },
+  
+  "transportKeys":
+  [
+    { "watcher": [ "tester" ] }
+  ]
+}
