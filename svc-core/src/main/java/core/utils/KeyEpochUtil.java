@@ -9,9 +9,9 @@ import java.time.Instant;
 public class KeyEpochUtil
 {
   // For testing
-  public  static final long EPOCH_DURATION_MILLIS = 1800000L;   // 30 minutes in milliseconds
-  public  static final long KEY_VALIDITY_MILLIS   = 7200000L;   // 2 hours key valid
-  private static final long EPOCH_ZERO_MILLIS     = 0L; // 1970-01-01T00:00:00Z
+  public  static final long EPOCH_DURATION_MILLIS = 900000L;    // 15 minutes in milliseconds
+  public  static final long KEY_VALIDITY_MILLIS   = 3600000L;   // 1 hours key valid
+  private static final long EPOCH_ZERO_MILLIS     = 0L;         // 1970-01-01T00:00:00Z
 
   // Production
 //  public  static final long EPOCH_DURATION_MILLIS = 3 * 60 * 60 * 1000L;  // 3 hours in milliseconds

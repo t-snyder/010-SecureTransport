@@ -1,0 +1,18 @@
+{
+  "type": "record",
+  "name": "DilithiumKey",
+  "namespace": "svc.model",
+  "fields": 
+  [
+    { "name": "keyId",             "type": "string" },
+    { "name": "serviceId",         "type": "string" },
+    { "name": "publicKeyBytes",    "type": "bytes"  },
+    { "name": "privateKeyBytes",   "type": ["bytes", "null"] },
+    { "name": "epochNumber",       "type": "long" },
+    { "name": "createTime",        "type": "string" },
+    { "name": "expiryTime",        "type": "string" },
+    { "name": "metadataKeyId",     "type": ["string", "null"] },
+    { "name": "metadataSignature", "type": ["bytes",  "null"] }
+  ],
+  "doc": "Transport object for DilithiumKey in kyber key exchange and key rotation"
+}

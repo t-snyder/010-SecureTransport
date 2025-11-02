@@ -28,13 +28,15 @@ public interface ServiceCoreIF
   public static final String KyberRotateRequest  = "KyberRotateRequest";  // Key rotate request event msg Type
   public static final String KyberRotateResponse = "KyberRotateResponse"; // Key rotate response event msg Type
 
-  // Topics
-  public static final String MetaDataClientRequestStream      = "metadata/client/request";      // topic for metadata service receiving a client request client data
-  public static final String MetaDataClientNotificationStream = "metadata/client/notification"; // topic for metadata service sending data available to all subscribers
-  public static final String MetaDataClientCaCertStream       = "metadata/client/ca-cert";                   // nats stream for sending clients updated ca-certificate bundles 
+  // Topics (dot-separated NATS subjects)
+  // Use '.' token separators for predictable wildcard matching in JetStream ("metadata.>" etc.)
+  public static final String MetaDataClientRequestStream      = "metadata.client.request";      // metadata service receives a client request
+  public static final String MetaDataClientNotificationStream = "metadata.client.notification"; // metadata service publishes notifications
+  public static final String MetaDataClientCaCertStream       = "metadata.client.ca-cert";      // nats stream for sending clients updated ca certificate bundles
 
-  public static final String KeyExchangeStreamBase   = "metadata/bundle-pull/svc-";      // topic for metadata service to receive a key exchange request
-  public static final String BundlePushStreamBase    = "metadata/bundle-push/svc-";      // topic for metadata service to receive a key exchange request
+  // Base subjects used when composing per-service subjects (append svc id suffix)
+  public static final String KeyExchangeStreamBase   = "metadata.bundle-pull.svc-";      // base for key-exchange requests (append service id)
+  public static final String BundlePushStreamBase    = "metadata.bundle-push.svc-";      // base for bundle-push messages (append service id)
 
   // Service configMap default env key
   public static final String ConfDefaultKey     = "serviceConfig";

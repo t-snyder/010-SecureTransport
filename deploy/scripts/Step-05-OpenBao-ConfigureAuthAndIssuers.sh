@@ -4,7 +4,7 @@
 
 set -e
 
-PROTODIR=/media/tim/ExtraDrive1/Projects/009-SecureKeyAndCertRotation/deploy
+PROTODIR=/media/tim/ExtraDrive1/Projects/010-SecureTransport/deploy
 CA_CERT_PATH="/openbao/userconfig/openbao-tls/openbao.ca"
 
 wait_for_openbao() {
@@ -96,8 +96,8 @@ path "secret/data/signing-keys/*" {
 EOF
 
 echo "Creating policy for writing signing keys..."
-kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH pulsar-signing-keys-write - <<EOF
-path "secret/data/signing-keys/pulsar/*" {
+kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH nats-signing-keys-write - <<EOF
+path "secret/data/signing-keys/nats/*" {
   capabilities = ["create", "update", "read", "delete", "list"]
 }
 EOF
@@ -115,9 +115,9 @@ path "secret/data/signing-keys/watcher/*" {
 EOF
 
 ###########################################################################################
-echo "Creating pulsar-tls-issuer role..."
-kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH pulsar_int/roles/pulsar-tls-issuer \
-  allowed_domains=pulsar \
+echo "Creating nats-tls-issuer role..."
+kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH nats_int/roles/nats-tls-issuer \
+  allowed_domains=nats \
   allow_subdomains=true \
   allow_bare_domains=true \
   allow_any_name=true \
@@ -125,16 +125,16 @@ kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH pulsar_
   key_type=rsa \
   key_bits=4096
 
-echo "Creating pulsar-tls-issuer policy..."
-kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH pulsar-tls-issuer - <<EOF
-path "pulsar_int/*"                          { capabilities = ["read", "list"] }
-path "pulsar_int/roles/pulsar-tls-issuer"   { capabilities = ["read", "list", "create", "update"] }
-path "pulsar_int/sign/pulsar-tls-issuer"    { capabilities = ["create", "update"] }
-path "pulsar_int/issue/pulsar-tls-issuer"   { capabilities = ["create"] }
+echo "Creating bats-tls-issuer policy..."
+kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH nats-tls-issuer - <<EOF
+path "nats_int/*"                     { capabilities = ["read", "list"] }
+path "nats_int/roles/nats-tls-issuer" { capabilities = ["read", "list", "create", "update"] }
+path "nats_int/sign/nats-tls-issuer"  { capabilities = ["create", "update"] }
+path "nats_int/issue/nats-tls-issuer" { capabilities = ["create"] }
 EOF
 
-kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH pulsar-ca-admin - <<EOF
-path "pulsar_int/*" {
+kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH nats-ca-admin - <<EOF
+path "nats_int/*" {
   capabilities = ["create", "read", "update", "delete", "list"]
 }
 path "pki/root/sign-intermediate" {
@@ -142,9 +142,9 @@ path "pki/root/sign-intermediate" {
 }
 EOF
 
-echo "Creating policy: pulsar-policy"
-kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH pulsar-policy - <<EOF
-path "secret/data/pulsar/*" {
+echo "Creating policy: nats-policy"
+kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH nats-policy - <<EOF
+path "secret/data/nats/*" {
   capabilities = ["read"]
 }
 path "auth/token/renew-self" {
@@ -153,14 +153,14 @@ path "auth/token/renew-self" {
 path "auth/token/lookup-self" {
   capabilities = ["read"]
 }
-path "auth/approle/role/pulsar/secret-id" {
+path "auth/approle/role/nats/secret-id" {
   capabilities = ["update", "create"]
 }
 EOF
 
-echo "Creating AppRole: pulsar"
-kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH auth/approle/role/pulsar \
-    token_policies="pulsar-policy,pulsar-tls-issuer,signing-keys-read" \
+echo "Creating AppRole: nats"
+kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH auth/approle/role/nats \
+    token_policies="nats-policy,nats-tls-issuer,signing-keys-read" \
     token_ttl=1d \
     token_max_ttl=1d \
     bind_secret_id=true \
@@ -169,8 +169,8 @@ kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH auth/ap
 
 ###########################################################################################
 echo "Creating metadata-tls-issuer role..."
-kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH pulsar_int/roles/metadata-tls-issuer \
-  allowed_domains=metadata.pulsar \
+kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH nats_int/roles/metadata-tls-issuer \
+  allowed_domains=metadata.nats \
   allow_subdomains=true \
   allow_bare_domains=true \
   allow_any_name=true \
@@ -180,10 +180,10 @@ kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH pulsar_
 
 echo "Creating metadata-tls-issuer policy..."
 kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH metadata-tls-issuer - <<EOF
-path "pulsar_int/*"                           { capabilities = ["read", "list"] }
-path "pulsar_int/roles/metadata-tls-issuer"   { capabilities = ["read", "list", "create", "update"] }
-path "pulsar_int/sign/metadata-tls-issuer"    { capabilities = ["create", "update"] }
-path "pulsar_int/issue/metadata-tls-issuer"   { capabilities = ["create"] }
+path "nats_int/*"                           { capabilities = ["read", "list"] }
+path "nats_int/roles/metadata-tls-issuer"   { capabilities = ["read", "list", "create", "update"] }
+path "nats_int/sign/metadata-tls-issuer"    { capabilities = ["create", "update"] }
+path "nats_int/issue/metadata-tls-issuer"   { capabilities = ["create"] }
 EOF
 
 echo "Creating policy: metadata-policy"
@@ -215,14 +215,31 @@ path "metadata_pki/crl" {
 path "metadata_pki/revoke" {
   capabilities = ["create", "update"]
 }
-path "pulsar_int/ca_chain" {
+path "nats_int/ca_chain" {
   capabilities = ["read"]
 }
+
+path "secret/data/service-bundles/*" {
+  capabilities = ["create", "update", "read", "list"]
+}
+
+path "secret/metadata/service-bundles/*" {
+  capabilities = ["read", "list", "delete"]
+}
+
+path "secret/data/ca-bundles/*" {
+  capabilities = ["create", "update", "read", "list"]
+}
+
+path "secret/metadata/ca-bundles/*" {
+  capabilities = ["read", "list", "delete"]
+}
+
 EOF
 
 echo "Creating AppRole: metadata"
 kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH auth/approle/role/metadata \
-    token_policies="metadata-policy,metadata-tls-issuer,signing-keys-read,metadata-signing-keys-write,metadata-pki-admin,pulsar-ca-admin" \
+    token_policies="metadata-policy,metadata-tls-issuer,signing-keys-read,metadata-signing-keys-write,metadata-pki-admin,nats-ca-admin" \
     token_ttl=1d \
     token_max_ttl=1d \
     bind_secret_id=true \
@@ -231,8 +248,8 @@ kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH auth/ap
 
 ###########################################################################################
 echo "Creating watcher-tls-issuer role..."
-kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH pulsar_int/roles/watcher-tls-issuer \
-  allowed_domains=watcher.pulsar \
+kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH nats_int/roles/watcher-tls-issuer \
+  allowed_domains=watcher \
   allow_subdomains=true \
   allow_bare_domains=true \
   allow_any_name=true \
@@ -242,10 +259,10 @@ kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH pulsar_
 
 echo "Creating watcher-tls-issuer policy..."
 kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH watcher-tls-issuer - <<EOF
-path "pulsar_int/*"                          { capabilities = ["read", "list"] }
-path "pulsar_int/roles/watcher-tls-issuer"   { capabilities = ["read", "list", "create", "update"] }
-path "pulsar_int/sign/watcher-tls-issuer"    { capabilities = ["create", "update"] }
-path "pulsar_int/issue/watcher-tls-issuer"   { capabilities = ["create"] }
+path "nats_int/*"                          { capabilities = ["read", "list"] }
+path "nats_int/roles/watcher-tls-issuer"   { capabilities = ["read", "list", "create", "update"] }
+path "nats_int/sign/watcher-tls-issuer"    { capabilities = ["create", "update"] }
+path "nats_int/issue/watcher-tls-issuer"   { capabilities = ["create"] }
 EOF
 
 echo "Creating policy: watcher-policy"
@@ -253,17 +270,46 @@ kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH 
 path "secret/data/watcher/*" {
   capabilities = ["read"]
 }
+
 path "auth/token/renew-self" {
   capabilities = ["update"]
 }
+
 path "auth/token/lookup-self" {
   capabilities = ["read"]
 }
+
+# AppRole secret-id rotation
 path "auth/approle/role/watcher/secret-id" {
   capabilities = ["update", "create"]
 }
-path "pulsar_int/ca_chain" {
+
+# PKI CA chain access
+path "nats_int/ca_chain" {
   capabilities = ["read"]
+}
+
+# ServiceBundle read for watcher
+path "secret/data/service-bundles/watcher/*" {
+  capabilities = ["read", "list"]
+}
+
+path "secret/metadata/service-bundles/watcher/*" {
+  capabilities = ["read", "list"]
+}
+
+# CaBundle read for NATS
+path "secret/data/ca-bundles/NATS/*" {
+  capabilities = ["read", "list"]
+}
+
+path "secret/metadata/ca-bundles/NATS/*" {
+  capabilities = ["read", "list"]
+}
+
+# Alow reading metadata service bundles
+path "secret/data/service-bundles/metadata/*" {
+  capabilities = ["read", "list"]
 }
 EOF
 
@@ -276,55 +322,4 @@ kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH auth/ap
     secret_id_ttl=12h \
     secret_id_num_uses=0
 
-###########################################################################################
-#echo "Creating metadata-pki-admin policy..."
-#kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH metadata-pki-admin - <<EOF
-#path "metadata_pki/*" {
-#  capabilities = ["create", "read", "update", "delete", "list"]
-#}
-#EOF
-
-#echo "Updating metadata policy with PKI permissions..."
-#kubectl exec -n openbao openbao-0 -i -- bao policy write -ca-cert=$CA_CERT_PATH metadata-policy - <<EOF
-#path "secret/data/metadata/*" {
-#  capabilities = ["read"]
-#}
-#path "auth/token/renew-self" {
-#  capabilities = ["update"]
-#}
-#path "auth/token/lookup-self" {
-#  capabilities = ["read"]
-#}
-#path "auth/approle/role/metadata/secret-id" {
-#  capabilities = ["update", "create"]
-#}
-#path "metadata_pki/issue/service-role" {
-#  capabilities = ["create", "update"]
-#}
-#path "metadata_pki/ca" {
-#  capabilities = ["read"]
-#}
-#path "metadata_pki/ca_chain" {
-#  capabilities = ["read"]
-#}
-#path "metadata_pki/crl" {
-#  capabilities = ["read"]
-#}
-#path "metadata_pki/revoke" {
-#  capabilities = ["create", "update"]
-#}
-#path "pulsar_int/ca_chain" {
-#  capabilities = ["read"]
-#}
-#EOF
-
-#echo "Updating AppRole: metadata with PKI policies - INCLUDING pulsar-ca-admin"
-#kubectl exec -n openbao openbao-0 -i -- bao write -ca-cert=$CA_CERT_PATH auth/approle/role/metadata \
-#    token_policies="metadata-policy,metadata-tls-issuer,signing-keys-read,metadata-signing-keys-write,metadata-pki-admin,pulsar-ca-admin" \
-#    token_ttl=1d \
-#    token_max_ttl=1d \
-#    bind_secret_id=true \
-#    secret_id_ttl=12h \
-#    secret_id_num_uses=0
-
-#echo "OpenBao is set up for CA cert signing, AppRole authentication, and secrets"
+echo "OpenBao is set up for CA cert signing, AppRole authentication, and secrets"

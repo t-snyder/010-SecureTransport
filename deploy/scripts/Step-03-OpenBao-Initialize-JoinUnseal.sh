@@ -6,7 +6,7 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 
 NAMESPACE="openbao"
-PROTODIR=/media/tim/ExtraDrive1/Projects/009-SecureKeyAndCertRotation/deploy
+PROTODIR=/media/tim/ExtraDrive1/Projects/010-SecureTransport/deploy
 CA_CERT_PATH="/openbao/userconfig/openbao-tls/openbao.ca"
 CLIENT_CERT_PATH="/openbao/userconfig/openbao-tls/openbao.crt"
 CLIENT_KEY_PATH="/openbao/userconfig/openbao-tls/openbao.key"

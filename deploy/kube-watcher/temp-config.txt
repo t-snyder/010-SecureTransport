@@ -1,0 +1,39 @@
+# NATS Configuration Properties for Simple mTLS Authentication
+# This replaces JWT complexity with direct mTLS authentication
+
+# NATS Server Connection
+nats.urls=tls://nats.nats.svc.cluster.local:4222
+nats.connection.timeout=15000
+nats.reconnect.wait=2000
+nats.max.reconnects=10
+
+# TLS Configuration - Simple mTLS (no JWT needed)
+nats.tls.enabled=true
+nats.tls.cert.path=/etc/nats-client-tls-certs/tls.crt
+nats.tls.key.path=/etc/nats-client-tls-certs/tls.key
+nats.tls.ca.path=/etc/nats-ca-certs/ca.crt
+
+# Service Identity (must match certificate CN and NATS user)
+nats.client.identity=watcher-service
+nats.service.id=watcher
+
+# JetStream Configuration
+nats.jetstream.enabled=true
+nats.jetstream.domain=
+
+# Subject Mappings (converted from Pulsar topics)
+# Original Pulsar: persistent://metadata/bundle-pull/svc-metadata
+# NATS Subject:   metadata.bundle-pull.svc-metadata
+
+# Watcher Service Subjects (from your Pulsar ACLs)
+nats.subjects.publish=metadata.bundle-pull.svc-metadata,metadata.bundle-pull.svc-tester,auth.tester.consumer
+nats.subjects.subscribe=metadata.bundle-pull.svc-watcher,metadata.bundle-push.svc-watcher,metadata.client.ca-cert
+
+# Consumer Configuration  
+nats.consumer.durable=true
+nats.consumer.ack.wait=30000
+nats.consumer.max.deliver=3
+
+# Hot Certificate Reload
+nats.cert.reload.enabled=true
+nats.cert.watch.paths=/etc/nats-client-tls-certs/tls.crt,/etc/nats-ca-certs/ca.crt

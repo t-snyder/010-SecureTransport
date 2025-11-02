@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metadata
+  namespace: metadata
+  labels:
+    app: metadata
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metadata
+  template:
+    metadata:
+      labels:
+        app: metadata
+    spec:
+      serviceAccountName: metadata-sa
+
+      volumes:
+      - name: bao-approle
+        projected:
+          sources:
+          - secret:
+              name: metadata-bao-approle
+              items:
+              - key: role-id
+                path: role-id
+              - key: secret-id
+                path: secret-id
+      - name: openbao-ca
+        projected:
+          sources:
+          - secret:
+              name: openbao-ca-secret
+              items:
+              - key: ca.crt
+                path: ca.crt
+      - name: nats-client-tls-certs
+        secret:
+          secretName: metadata-nats-client-tls
+          defaultMode: 0440
+      - name: nats-ca-secret
+        secret:
+          secretName: nats-ca-secret
+          defaultMode: 0440
+      - name: nats-ca
+        emptyDir: {}
+      - name: avro-schemas
+        configMap:
+          name: avro-schemas
+      - name: metadata-config
+        configMap:
+          name: metadata-configmap
+      - name: client-certs
+        persistentVolumeClaim:
+          claimName: client-certs-pvc
+      - name: bao-agent-config
+        configMap:
+          name: bao-agent-config
+          items:
+            - key: agent.hcl
+              path: agent.hcl
+      - name: bao-agent-token
+        persistentVolumeClaim:
+          claimName: bao-agent-token-pvc
+      - name: bao-agent-cache
+        emptyDir:
+          sizeLimit: "50Mi"
+
+      containers:
+      - name: bao-agent
+        image: openbao/openbao:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: bao-approle
+          mountPath: /etc/bao
+        - name: bao-agent-config
+          mountPath: /etc/bao-agent
+          readOnly: true
+        - name: openbao-ca
+          mountPath: /etc/bao/ca
+          readOnly: true
+        - name: bao-agent-token
+          mountPath: /home/bao
+        - name: bao-agent-cache
+          mountPath: /home/bao/cache
+        command: ["bao", "agent", "-config=/etc/bao-agent/agent.hcl"]
+        env:
+        - name: VAULT_LOG_LEVEL
+          value: "info"
+
+      - name: metadata
+        image: library/metadatasvc:1.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: CONFIG_MAP_NAME
+          value: "metadata-configmap"
+        volumeMounts:
+        - name: metadata-config
+          mountPath: /app/config
+          readOnly: true
+        - name: nats-client-tls-certs
+          mountPath: /etc/nats-client-tls-certs
+          readOnly: true
+        - name: openbao-ca
+          mountPath: /etc/openbao-ca-certs
+          readOnly: true
+        - name: avro-schemas
+          mountPath: /app/avro-schemas
+          readOnly: true
+        - name: client-certs
+          mountPath: /app/certs
+        - name: bao-agent-token
+          mountPath: /home/bao
+        - name: nats-ca-secret
+          mountPath: /etc/nats-ca-certs-ro
+          readOnly: true
+        - name: nats-ca
+          mountPath: /etc/nats-ca-certs          

@@ -8,6 +8,9 @@ import java.util.*;
 //import java.util.regex.Matcher;
 //import java.util.regex.Pattern;
 
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,7 +28,65 @@ public class DeclarativeACLParser extends ServicesACLParser
   {
     super(vertx);
   }
-  
+
+  /**
+   * Parse a YAML ACL manifest string to structured ServicesACLConfig.
+   */
+  public Future<ServicesACLConfig> parseFromYaml(String yamlString)
+  {
+    return workerExecutor.executeBlocking(() -> {
+      try
+      {
+        if (yamlString == null || yamlString.trim().isEmpty())
+        {
+          LOGGER.warn("Empty YAML provided for ACLs");
+          return new ServicesACLConfig();
+        }
+
+        LOGGER.info("Parsing ACL YAML to structured config");
+        Yaml yaml = new Yaml();
+        Map<String, Object> yamlMap = yaml.load(yamlString);
+
+        ServicesACLConfig config = new ServicesACLConfig();
+
+        if (!yamlMap.containsKey("roles"))
+          throw new IllegalArgumentException("YAML ACL manifest missing 'roles' root");
+
+        Map<String, Object> roles = (Map<String, Object>) yamlMap.get("roles");
+        for (Map.Entry<String, Object> roleEntry : roles.entrySet())
+        {
+          String serviceId = roleEntry.getKey();
+          Map<String, Object> perms = (Map<String, Object>) roleEntry.getValue();
+
+          // Publish
+          if (perms.containsKey("publish"))
+          {
+            List<Object> topics = (List<Object>) perms.get("publish");
+            for (Object topic : topics)
+            {
+              config.addPermission(serviceId, topic.toString(), PermissionType.PRODUCE);
+            }
+          }
+          // Subscribe
+          if (perms.containsKey("subscribe"))
+          {
+            List<Object> topics = (List<Object>) perms.get("subscribe");
+            for (Object topic : topics)
+            {
+              config.addPermission(serviceId, topic.toString(), PermissionType.CONSUME);
+            }
+          }
+        }
+        LOGGER.info("Parsed YAML ACL: {} services, {} topics", config.getServiceCount(), config.getTopicCount());
+        return config;
+      }
+      catch (Exception e)
+      {
+        LOGGER.error("Failed to parse ACL YAML", e);
+        throw new RuntimeException("YAML parsing failed", e);
+      }
+    });
+  }  
   /**
    * Calculate what needs to be added/removed to reach desired state
    */

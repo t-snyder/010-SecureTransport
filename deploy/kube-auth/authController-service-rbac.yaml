@@ -1,0 +1,60 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: svc-authcontroller
+  namespace: auth
+  labels:
+    app: svc-authcontroller
+    component: serviceaccount
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: svc-authcontroller
+  namespace: auth
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["cert-manager.io"]
+  resources: ["certificates", "issuers", "clusterissuers"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: svc-authcontroller
+  namespace: auth
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: svc-authcontroller
+subjects:
+- kind: ServiceAccount
+  name: svc-authcontroller
+  namespace: auth
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-authcontroller
+  namespace: auth
+  labels:
+    app: svc-authcontroller
+    component: service
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8081
+    targetPort: 8081
+    protocol: TCP
+    name: monitoring
+  selector:
+    app: svc-authcontroller

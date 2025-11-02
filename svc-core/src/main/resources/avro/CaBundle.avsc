@@ -1,0 +1,14 @@
+{
+  "namespace": "core.model",
+  "type": "record",
+  "name": "CaBundleMessage",
+  "fields": 
+  [
+    { "name": "serverId",      "type": "string" },
+    { "name": "timestamp",     "type": "string" },
+    { "name": "caEpochNumber", "type": "long"   },
+    { "name": "eventType",     "type": "string" },
+    { "name": "caBundle",      "type": "string" },
+    { "name": "caVersion",     "type": "string" }
+  ]
+}

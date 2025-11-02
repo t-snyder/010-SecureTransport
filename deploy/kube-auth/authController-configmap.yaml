@@ -1,0 +1,43 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authcontroller-config
+  namespace: auth
+data:
+  # Service Identity
+  serviceId: "authcontroller"
+  
+  natsUseTLS: "true"
+  natsURL: "tls://10.1.1.12:4222"
+  tlsSecret: "authcontroller-tls-credential"
+  caCertFilePath: "/app/certs/nats-ca-certs/ca.crt"
+  clientCertPath: "/app/certs/nats-client-certs/"
+  
+  # Gateway Topics (consume from Gatekeeper's request topic, send to response topic)
+  gatewayRequestTopic:  "auth.auth-request"
+  gatewayResponseTopic: "gatekeeper.responder"
+  
+  # OpenBao Configuration
+  baoAgentHost:   "127.0.0.1"
+  authControllerAgentAddr: "http://127.0.0.1:8100"
+  authControllerAgentPort: "8100"
+  authControllerAgentTokenPath: "/home/bao/authcontroller/token"
+   
+  # AppRole Configuration
+  authControllerAppRoleName: "authcontroller"
+  authControllerAppRoleSecretName: "authcontroller-bao-approle"
+  secretIDRotationMs: "3600000"  # 1 hour
+  
+  # Performance Configuration
+  producerBatchSize: "1000"
+  consumerBatchSize: "1000"
+  maxConcurrentRequests: "10000"
+  requestTimeoutMs: "30000"      # 30 seconds
+  keyRotationIntervalMs: "10800000"  # 3 hours
+  
+  # AuthController Specific Configuration
+  authTokenValidityMs: "3600000"  # 1 hour
+  maxAuthAttempts: "5"
+  authCacheSize: "10000"
+  downtimeTrackingEnabled: "true"

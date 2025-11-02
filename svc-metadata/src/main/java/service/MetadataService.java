@@ -113,9 +113,9 @@ public class MetadataService
       LOGGER.info("MetadataService.initializeNatsClient() - Initializing NATS TLS client...");
 
       Map<String, String> natsConfig = new HashMap<String, String>();
-      natsConfig.put( NatsTLSClient.NATS_URLS,              metadataConfig.getNats().getNatsServers()        );
+      natsConfig.put( NatsTLSClient.NATS_URLS,              metadataConfig.getNats().getNatsUrl()        );
       natsConfig.put( NatsTLSClient.NATS_CA_CERT_PATH,      metadataConfig.getNats().getNatsCaCertFile()     );
-      natsConfig.put( NatsTLSClient.NATS_CLIENT_CERT_PATH,  metadataConfig.getNats().getNatsClientCertFile() );
+      natsConfig.put( NatsTLSClient.NATS_CLIENT_CERT_PATH,  metadataConfig.getNats().getNatsClientCertPath() );
       natsConfig.put( NatsTLSClient.NATS_CLIENT_SECRET,     metadataConfig.getNats().getNatsCredentialsFile() );
       
       natsTLSClient = new NatsTLSClient( vertx, natsConfig, kubeClient, metadataConfig.getServiceId(), nameSpace );

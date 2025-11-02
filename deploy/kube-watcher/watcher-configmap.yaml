@@ -4,33 +4,30 @@ metadata:
   name: watcher-config
   namespace: nats
 data:
-  watcherConfig.json: |
-    {
-      "kubeClusterName": "servers",
-      "serviceId": "watcher",
-      "environment": "testing",
+  serviceId: "watcher"
+  environment: "testing"
       
-      "nats": {
-        "natsUseTLS": "true",
-        "natsUrl": "tls://nats.nats.svc.cluster.local:4222",
-        "tlsSecret": "watcher-nats-credential",
-        "caCertFilePath": "/app/certs/nats/ca.crt",
-        "clientCertPath": "/app/certs/nats-client/"
-      },
-      
-      "vault": {
-        "vaultagentAddr": "http://127.0.0.1:8100",
-        "vaultAgentHost": "127.0.0.1",
-        "vaultAgentPort": "8100",
-        "appRoleSecretName": "watcher-bao-approle",
-        "appRoleName": "watcher",
-        "appRoleTokenPath": "/home/bao/watcher/token"
-      },
-      
-      "certificateRotation": {
-        "watchStreams": ["METADATA_BUNDLE_PUSH", "METADATA_BUNDLE_PULL"],
-        "watchSubjects": ["metadata.bundle-push.>", "metadata.bundle-pull.>"],
-        "rotationCheckIntervalMinutes": 5,
-        "preRotationWarningMinutes": 30
-      }
-    }
+  natsUseTLS: "true"
+  natsUrl: "tls://nats.nats.svc.cluster.local:4222"
+  tlsSecret: "watcher-tls-credential"
+  caCertFilePath: "/app/certs/nats-ca-certs/ca.crt"
+  clientCertPath: "/app/certs/nats-client-certs/"
+     
+  # Vault Agent Attributes
+  vaultAgentHost:    "127.0.0.1"
+  secretIDRotationMs: "300000"
+
+  # Nats Vault Agent
+  natsAgentAddr:         "http://127.0.0.1:8101"
+  natsAgentPort:         "8101"
+  natsAppRoleSecretName: "nats-bao-approle"
+  natsAppRoleName:       "nats"
+  natsAgentTokenPath:    "/home/bao/nats/token"
+
+  # Watcher Vault Agent
+  watcherAgentAddr:         "http://127.0.0.1:8000"
+  watcherAgentPort:         "8100"
+  watcherAppRoleSecretName: "watcher-bao-approle"
+  watcherAppRoleName:       "watcher"
+  watcherAgentTokenPath:    "/home/bao/watcher/token"
+ 

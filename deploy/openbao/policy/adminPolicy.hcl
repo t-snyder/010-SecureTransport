@@ -67,8 +67,8 @@ path "pki*" {
   capabilities = [ "create", "read", "update", "delete", "list", "sudo", "patch" ]
 }
 
-# Work with pki secrets engine
-path "pulsar*" {
+# Work with nats secrets engine
+path "nats*" {
   capabilities = [ "create", "read", "update", "delete", "list", "sudo", "patch" ]
 }
 
@@ -77,7 +77,12 @@ path "vault_int/*" {
   capabilities = ["create", "read", "update", "delete", "list", "sudo", "patch"]
 }
 
-# Allow full management of metadata_pki PKI - THIS WAS MISSING
+# Allow full management of metadata_pki PKI
 path "metadata_pki/*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo", "patch"]
+}
+
+# Allow full management of nats_int PKI - THIS WAS MISSING!
+path "nats_int/*" {
   capabilities = ["create", "read", "update", "delete", "list", "sudo", "patch"]
 }

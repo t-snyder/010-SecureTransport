@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: services-acl
+  namespace: metadata
+data:
+  acl-manifest.yaml: |
+    roles:
+      watcher:
+        publish:
+          - "metadata.bundle-pull.svc-metadata"
+          - "metadata.bundle-pull.svc-tester"
+          - "auth.tester.consumer"
+        subscribe:
+          - "metadata.bundle-pull.svc-watcher"
+          - "metadata.bundle-push.svc-watcher"
+          - "metadata.client.ca-cert"
+      metadata:
+        publish:
+          - "metadata.bundle-pull.svc-watcher"
+          - "metadata.bundle-pull.svc-tester"
+          - "metadata.bundle-pull.svc-authcontroller"
+          - "metadata.bundle-pull.svc-gatekeeper"
+          - "metadata.bundle-push.svc-watcher"
+          - "metadata.bundle-push.svc-tester"
+          - "metadata.bundle-push.svc-authcontroller"
+          - "metadata.bundle-push.svc-gatekeeper"
+          - "metadata.client.ca-cert"
+        subscribe:
+          - "metadata.bundle-pull.svc-metadata"
+          - "metadata.client.request"
+      tester:
+        publish:
+          - "metadata.bundle-pull.svc-metadata"
+        subscribe:
+          - "metadata.bundle-pull.svc-tester"
+          - "metadata.bundle-push.svc-tester"
+          - "metadata.client.ca-cert"
+          - "auth.tester.consumer"
+      authcontroller:
+        publish:
+          - "metadata.bundle-pull.svc-metadata"
+          - "metadata.bundle-pull.svc-tester"
+          - "gatekeeper.responder"
+        subscribe:
+          - "metadata.bundle-pull.svc-authcontroller"
+          - "metadata.bundle-push.svc-authcontroller"
+          - "metadata.client.ca-cert"
+          - "auth.auth-request"
+      gatekeeper:
+        publish:
+          - "metadata.bundle-pull.svc-metadata"
+          - "metadata.bundle-pull.svc-tester"
+          - "auth.auth-request"
+        subscribe:
+          - "metadata.bundle-pull.svc-gatekeeper"
+          - "metadata.bundle-push.svc-gatekeeper"
+          - "metadata.client.ca-cert"
+          - "gatekeeper.responder"
+      js-admin:
+        publish:
+          - "$JS.API.>"
+          - "metadata.>"
+        subscribe:
+          - "$JS.API.>"
+          - "$JS.EVENT.>"

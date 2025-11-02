@@ -1,0 +1,17 @@
+{
+  "type": "record",
+  "name": "KyberExchangeMessage",
+  "namespace": "svc.model",
+  "fields": 
+  [
+    { "name": "secretKeyId",    "type": "string" },
+    { "name": "sourceSvcId",    "type": "string" },
+    { "name": "targetSvcId",    "type": "string" },
+    { "name": "eventType",      "type": "string" },
+    { "name": "publicKey",      "type": "bytes"  },
+    { "name": "encapsulation",  "type": ["bytes", "null"] },
+    { "name": "createTime",     "type": "string" },
+    { "name": "expiryTime",     "type": "string" },
+    { "name": "additionalData", "type": ["null", "bytes"], "default": null }
+  ]
+}

@@ -1,0 +1,38 @@
+---
+# Certificate for TLS authentication with Pulsar
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: authcontroller-tls-credential
+  namespace: auth
+  labels:
+    app: svc-authcontroller
+    component: tls
+spec:
+  isCA: false
+  duration: "6h"
+  renewBefore: "3h"
+  subject:
+    organizations:
+    - authcontroller
+  commonName: authcontroller
+  dnsNames:
+    - localhost
+    - authcontroller
+    - svc-authcontroller
+  ipAddresses:
+    - 127.0.0.1
+    - 10.1.1.13
+  privateKey:
+    algorithm: RSA
+    size: 4096
+    rotationPolicy: Always  # This allows cert-manager to replace the key
+  usages:
+  - digital signature
+  - key encipherment
+  - client auth
+  secretName: authcontroller-tls-credential
+  issuerRef:
+    name: authcontroller-tls-issuer
+    kind: Issuer
+    group: cert-manager.io

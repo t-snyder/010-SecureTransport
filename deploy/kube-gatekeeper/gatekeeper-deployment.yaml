@@ -1,0 +1,213 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc-gatekeeper
+  namespace: gatekeeper
+  labels:
+    app: svc-gatekeeper
+    version: v1.0.0
+    component: microservice
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: svc-gatekeeper
+  template:
+    metadata:
+      labels:
+        app: svc-gatekeeper
+        version: v1.0.0
+        component: microservice
+    spec:
+      serviceAccountName: svc-gatekeeper
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+
+      volumes:
+      - name: gatekeeper-config
+        configMap:
+          name: gatekeeper-config          # corrected (was gateway-config)
+
+      - name: gatekeeper-bao-approle
+        projected:
+          sources:
+          - secret:
+              name: gatekeeper-bao-approle
+              items:
+              - key: role-id
+                path: role-id
+              - key: secret-id
+                path: secret-id
+
+      - name: gatekeeper-bao-agent-config
+        configMap:
+          name: gatekeeper-bao-agent-config
+          items:
+          - key: agent.hcl
+            path: agent.hcl
+
+      - name: gatekeeper-bao-agent-cache
+        emptyDir:
+          sizeLimit: "50Mi"
+
+      - name: gatekeeper-bao-token
+        emptyDir: {}
+
+      # CA bundle for Vault Agent TLS
+      - name: openbao-ca
+        projected:
+          sources:
+          - secret:
+              name: openbao-ca-secret
+              items:
+              - key: ca.crt
+                path: ca.crt
+
+      # NATS CA bundle (emptyDir so the client can write/update ca.crt similar to authcontroller)
+      - name: nats-ca-certs
+        emptyDir: {}
+
+      # NATS client cert/key (same secret pattern as authcontroller)
+      - name: nats-client-certs
+        secret:
+          secretName: gatekeeper-tls-credential
+          items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+
+      - name: avro-schemas
+        configMap:
+          name: avro-schemas
+
+      - name: client-certs
+        emptyDir: {}
+
+      - name: temp-volume
+        emptyDir:
+          sizeLimit: 1Gi
+
+      - name: heapdump-volume
+        emptyDir:
+          sizeLimit: 2Gi
+
+      containers:
+      - name: gatekeeper-bao-agent
+        image: openbao/openbao:latest 
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ "ALL" ]
+        volumeMounts:
+        - name: gatekeeper-bao-approle
+          mountPath: /etc/bao/gatekeeper
+
+        - name: gatekeeper-bao-agent-config
+          mountPath: /etc/bao-agent
+          readOnly: true
+
+        - name: openbao-ca
+          mountPath: /etc/bao/ca
+          readOnly: true
+
+        - name: gatekeeper-bao-token
+          mountPath: /home/bao/gatekeeper
+
+        - name: gatekeeper-bao-agent-cache
+          mountPath: /home/bao/gatekeeper/cache
+
+        command: ["bao", "agent", "-config=/etc/bao-agent/agent.hcl"]
+        env:
+        - name: BAO_LOG_LEVEL
+          value: "info"
+
+      - name: gatekeeper
+        image: library/gatekeeper:1.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ "ALL" ]
+        ports:
+        - containerPort: 8081          # Align with authcontroller if you want uniform probes; change from 8080
+          name: http
+          protocol: TCP
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: JAVA_OPTS
+          value: "-Xms1g -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+#        livenessProbe:
+#          httpGet:
+#            path: /health
+#            port: http
+#          initialDelaySeconds: 60
+#          periodSeconds: 30
+#          timeoutSeconds: 10
+#          failureThreshold: 3
+#        readinessProbe:
+#          httpGet:
+#            path: /health
+#            port: http
+#          initialDelaySeconds: 30
+#          periodSeconds: 10
+#          timeoutSeconds: 5
+#          failureThreshold: 3
+#        startupProbe:
+#          httpGet:
+#            path: /health
+#            port: http
+#          initialDelaySeconds: 30
+#          periodSeconds: 10
+#          timeoutSeconds: 5
+#          failureThreshold: 12
+
+        volumeMounts:
+        - name: gatekeeper-config
+          mountPath: /app/config
+          readOnly: true
+        - name: nats-ca-certs
+          mountPath: /app/certs/nats-ca-certs
+        - name: nats-client-certs
+          mountPath: /app/certs/nats-client-certs
+        - name: openbao-ca
+          mountPath: /app/openbao-ca
+        - name: avro-schemas
+          mountPath: /app/avro-schemas
+          readOnly: true
+        - name: gatekeeper-bao-approle
+          mountPath: /app/bao/gatekeeper
+        - name: gatekeeper-bao-token
+          mountPath: /home/bao/gatekeeper
+        - name: temp-volume
+          mountPath: /tmp
+        - name: heapdump-volume
+          mountPath: /app/heapdumps

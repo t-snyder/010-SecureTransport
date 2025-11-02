@@ -39,23 +39,23 @@ spec:
               path: agent.hcl
       - name: watcher-bao-token
         emptyDir: {}
-      - name: pulsar-bao-approle
+      - name: nats-bao-approle
         secret:
-          secretName: pulsar-bao-approle
+          secretName: nats-bao-approle
           items:
             - key: role-id
               path: role-id
             - key: secret-id
               path: secret-id
-      - name: pulsar-bao-agent-config
+      - name: nats-bao-agent-config
         configMap:
-          name: pulsar-bao-agent-config
+          name: nats-bao-agent-config
           items:
             - key: agent.hcl
               path: agent.hcl
-      - name: pulsar-bao-token
+      - name: nats-bao-token
         emptyDir: {}
-      - name: pulsar-bao-agent-cache
+      - name: nats-bao-agent-cache
         emptyDir:
           sizeLimit: "50Mi"
       - name: watcher-bao-agent-cache
@@ -72,15 +72,10 @@ spec:
               - key: ca.crt
                 path: ca.crt
 
-      - name: pulsar-ca
+      - name: nats-ca-certs
         emptyDir: {}
-#        secret:
-#          secretName: pulsar-ca-secret 
-#          items:
-#          - key: ca.crt
-#            path: ca.crt 
   
-      - name: proxy-certs
+      - name: nats-client-certs
         secret:
           secretName: "watcher-tls-credential"
           items:
@@ -88,12 +83,15 @@ spec:
             path: tls.crt
           - key: tls.key
             path: tls.key
+
       - name: watcher-config
         configMap:
           name: watcher-config
+
       - name: avro-schemas
         configMap:
           name: avro-schemas 
+
       - name: client-certs
         emptyDir: {}
 
@@ -134,7 +132,7 @@ spec:
         - name: VAULT_LOG_LEVEL
           value: "info"
 
-      - name: pulsar-vault-agent
+      - name: nats-vault-agent
         image: openbao/openbao:latest
         imagePullPolicy: IfNotPresent
 
@@ -148,16 +146,16 @@ spec:
             - ALL
 
         volumeMounts:
-        - name: pulsar-bao-approle
-          mountPath: /etc/bao/pulsar
-        - name: pulsar-bao-token
-          mountPath: /home/bao/pulsar
-        - name: pulsar-bao-agent-config
+        - name: nats-bao-approle
+          mountPath: /etc/bao/nats
+        - name: nats-bao-token
+          mountPath: /home/bao/nats
+        - name: nats-bao-agent-config
           mountPath: /etc/bao-agent
         - name: openbao-ca
           mountPath: /etc/bao/ca
-        - name: pulsar-bao-agent-cache
-          mountPath: /home/bao/pulsar/cache  # cache persistence directory
+        - name: nats-bao-agent-cache
+          mountPath: /home/bao/nats/cache  # cache persistence directory
 
         command: ["bao", "agent", "-config=/etc/bao-agent/agent.hcl"]
 
@@ -180,10 +178,12 @@ spec:
         - name: watcher-config
           mountPath: /app/config
           readOnly: true
-        - name: pulsar-ca
-          mountPath: "/app/certs/pulsar"
-        - name: proxy-certs
-          mountPath: "/app/certs/proxy"
+        - name: nats-ca-certs
+          mountPath: "/app/certs/nats-ca-certs"
+        - name: nats-client-certs
+          mountPath: "/app/certs/nats-client-certs"
+        - name: openbao-ca
+          mountPath: /app/openbao-ca
         - name: avro-schemas
           mountPath: "/app/avro-schemas"
           readOnly: true
@@ -193,7 +193,7 @@ spec:
           mountPath: "/app/bao/watcher"
         - name: watcher-bao-token
           mountPath: /home/bao/watcher
-        - name: pulsar-bao-approle
-          mountPath: "/app/bao/pulsar"
-        - name: pulsar-bao-token
-          mountPath: /home/bao/pulsar
+        - name: nats-bao-approle
+          mountPath: "/app/bao/nats"
+        - name: nats-bao-token
+          mountPath: /home/bao/nats

@@ -8,7 +8,7 @@ data:
     pid_file       = "/home/bao/watcher/pidfile"
 
     vault {
-      address = "https://10.1.1.12:8200"  # Update as needed
+      address = "https://10.1.1.12:8200" 
       tls_ca_file = "/etc/bao/ca/ca.crt"
       tls_skip_verify = true
       retry {

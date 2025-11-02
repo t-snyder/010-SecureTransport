@@ -11,8 +11,7 @@
     
     <!-- Version properties -->
     <vertx.version>5.0.0</vertx.version>
-    <fabric8.version>7.3.1</fabric8.version>
-    <pulsar.client.version>4.0.4</pulsar.client.version>
+    <fabric8.version>7.4.0</fabric8.version>
     <cassandra.driver.version>4.19.0</cassandra.driver.version>
     <jackson.version>2.18.2</jackson.version>
     <maven.compiler.source>21</maven.compiler.source>
@@ -45,7 +44,7 @@
       <artifactId>kubernetes-httpclient-okhttp</artifactId>
       <version>${fabric8.version}</version>
     </dependency>
-
+ 
     <!-- Vert.x Core -->
     <dependency>
       <groupId>io.vertx</groupId>

@@ -1,0 +1,10 @@
+{
+  "namespace": "core.model",
+  "type": "record",
+  "name": "AuthenticationRequest",
+  "fields": [
+    { "name": "userId",  "type": "string" },
+    { "name": "pwdHash", "type": "string" },
+    { "name": "otp",     "type": ["string", "null"] }
+  ]
+}

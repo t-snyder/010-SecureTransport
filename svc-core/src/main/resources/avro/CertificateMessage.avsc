@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "CertificateMessage",
+  "namespace": "svc.model",
+  "fields": 
+  [
+    { "name": "msgId",     "type": "string" },
+    { "name": "timestamp", "type": "long"   },
+    { "name": "eventType", "type": "string" },
+    { "name": "serviceId", "type": "string" },
+    { "name": "caCert",    "type": "string" },
+    { "name": "tlsCert",   "type": "string" }
+  ],
+  "doc": "Transport object for tls CA Certificate"
+}
+  

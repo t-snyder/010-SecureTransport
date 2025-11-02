@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metadata-configmap
+  namespace: metadata
+data:
+  messaging.url: "tls://10.1.1.12:4222"
+  messaging.type: "nats"
+  messaging.tls.enabled: "true"
+  messaging.tls.cert: "/etc/nats-client-tls-certs/tls.crt"
+  messaging.tls.key: "/etc/nats-client-tls-certs/tls.key"
+  messaging.tls.ca: "/etc/nats-ca-certs/ca.crt"
+  messaging.client.identity: "metadata"
+  messaging.service.id: "metadata"

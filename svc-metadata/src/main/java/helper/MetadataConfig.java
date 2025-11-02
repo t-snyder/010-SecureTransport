@@ -44,33 +44,25 @@ public class MetadataConfig
   // Nested Classes
   public static class NatsConfig
   {
-    @JsonProperty( "natsServers"           ) private String natsServers;
-    @JsonProperty( "natsUseTLS"            ) private String natsUseTLS;
-    @JsonProperty( "natsCredentialsFile"   ) private String natsCredentialsFile;
-    @JsonProperty( "natsJwtFile"           ) private String natsJwtFile;
-    @JsonProperty( "natsNkeyFile"          ) private String natsNkeyFile;
-    @JsonProperty( "natsCaCertFile"        ) private String natsCaCertFile;
-    @JsonProperty( "natsClientCertFile"    ) private String natsClientCertFile;
-    @JsonProperty( "natsClientKeyFile"     ) private String natsClientKeyFile;
-    @JsonProperty( "natsConnectionName"    ) private String natsConnectionName;
-    @JsonProperty( "jetstreamDomain"       ) private String jetstreamDomain;
-    @JsonProperty( "maxReconnectAttempts"  ) private String maxReconnectAttempts;
-    @JsonProperty( "reconnectWaitMs"       ) private String reconnectWaitMs;
-    @JsonProperty( "connectionTimeoutMs"   ) private String connectionTimeoutMs;
+    @JsonProperty( "natsUseTLS"          ) private String natsUseTLS;
+    @JsonProperty( "natsUrl"             ) private String natsUrl;
+    @JsonProperty( "natsCredentialsFile" ) private String natsCredentialsFile;
+    @JsonProperty( "natsCaCertFile"      ) private String natsCaCertFile;
+    @JsonProperty( "natsClientCertPath"  ) private String natsClientCertPath;
+    @JsonProperty( "natsClientCertFile"  ) private String natsClientCertFile;
+    @JsonProperty( "natsClientKeyFile"   ) private String natsClientKeyFile;
+    @JsonProperty( "clientIdentity"      ) private String clientIdentity;
+    @JsonProperty( "serviceId"           ) private String serviceId;
 
-    public String getNatsServers()          { return natsServers;          }
-    public String getNatsUseTLS()           { return natsUseTLS;           }
-    public String getNatsCredentialsFile()  { return natsCredentialsFile;  }
-    public String getNatsJwtFile()          { return natsJwtFile;          }
-    public String getNatsNkeyFile()         { return natsNkeyFile;         }
-    public String getNatsCaCertFile()       { return natsCaCertFile;       }
-    public String getNatsClientCertFile()   { return natsClientCertFile;   }
-    public String getNatsClientKeyFile()    { return natsClientKeyFile;    }
-    public String getNatsConnectionName()   { return natsConnectionName;   }
-    public String getJetstreamDomain()      { return jetstreamDomain;      }
-    public String getMaxReconnectAttempts() { return maxReconnectAttempts; }
-    public String getReconnectWaitMs()      { return reconnectWaitMs;      }
-    public String getConnectionTimeoutMs()  { return connectionTimeoutMs;  }
+    public String getNatsUseTLS()          { return natsUseTLS;           }
+    public String getNatsUrl()             { return natsUrl;              }
+    public String getNatsCredentialsFile() { return natsCredentialsFile;  }
+    public String getNatsCaCertFile()      { return natsCaCertFile;       }
+    public String getNatsClientCertPath()  { return natsClientCertPath;   }
+    public String getNatsClientCertFile()  { return natsClientCertFile;   }
+    public String getNatsClientKeyFile()   { return natsClientKeyFile;    }
+    public String getClientIdentity()      { return clientIdentity;       }
+    public String getServiceId()           { return serviceId;            }
   }
 
   public static class VaultConfig
@@ -94,17 +86,19 @@ public class MetadataConfig
 
   public static class KeyExchangeConfig
   {
-    @JsonProperty( "keyRotationMinutes"  ) private String keyRotationMinutes;
-    @JsonProperty( "svcKeyExchStreamBase") private String svcKeyExchStreamBase;
-    @JsonProperty( "expiryMinutes"       ) private String expiryMinutes;
-    @JsonProperty( "consumerStreamSvcId" ) private String consumerStreamSvcId;
-    @JsonProperty( "producerStreamSvcIds") private List<String> producerStreamSvcIds;
+    @JsonProperty( "keyRotationMinutes"     ) private String keyRotationMinutes;
+    @JsonProperty( "svcKeyExchStreamBase"   ) private String svcKeyExchStreamBase;
+    @JsonProperty( "svcKeyExchSubjectBase"  ) private String svcKeyExchSubjectBase;
+    @JsonProperty( "expiryMinutes"          ) private String expiryMinutes;
+    @JsonProperty( "consumerSubjectSvcId"   ) private String consumerSubjectSvcId;
+    @JsonProperty( "producerSubjectSvcIds"  ) private List<String> producerSubjectSvcIds;
 
-    public String       getKeyRotationMinutes()   { return keyRotationMinutes;   }
-    public String       getSvcKeyExchStreamBase() { return svcKeyExchStreamBase; }
-    public String       getExpiryMinutes()        { return expiryMinutes;        }
-    public String       getConsumerStreamSvcId()  { return consumerStreamSvcId;  }
-    public List<String> getProducerStreamSvcIds() { return producerStreamSvcIds; }
+    public String       getKeyRotationMinutes()     { return keyRotationMinutes;    }
+    public String       getSvcKeyExchStreamBase()   { return svcKeyExchStreamBase;  }
+    public String       getSvcKeyExchSubjectBase()  { return svcKeyExchSubjectBase; }
+    public String       getExpiryMinutes()          { return expiryMinutes;         }
+    public String       getConsumerSubjectSvcId()   { return consumerSubjectSvcId;  }
+    public List<String> getProducerSubjectSvcIds()  { return producerSubjectSvcIds; }
   }
   
   public static class ServicesACLConfig

@@ -1,0 +1,15 @@
+{
+  "type": "record",
+  "name": "TopicKey",
+  "namespace": "core.model.service",
+  "fields": [
+    { "name": "keyId",       "type": "string" },
+    { "name": "topicName",   "type": "string" },
+    { "name": "epochNumber", "type": "long"   },
+    { "name": "algorithm",   "type": "string" },
+    { "name": "keyData",     "type": "bytes"  },
+    { "name": "createdTime", "type": "string" },
+    { "name": "expiryTime",  "type": "string" },
+    { "name": "role",        "type": [ "null", "string" ], "default": null }
+  ]
+}

@@ -1,7 +1,7 @@
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: watcher-nats-credential
+  name: watcher-tls-credential
   namespace: nats 
 spec:
   isCA: false
@@ -19,10 +19,10 @@ spec:
     - localhost
     - watcher
     - watcher-service
-    - watcher-service.nats.svc.cluster.local
+    - watcher.nats.svc.cluster.local
   ipAddresses:
     - 127.0.0.1
     - 10.1.1.12
-  secretName: watcher-nats-credential
+  secretName: watcher-tls-credential
   issuerRef:
     name: watcher-tls-issuer

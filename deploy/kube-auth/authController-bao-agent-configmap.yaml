@@ -1,0 +1,67 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authcontroller-bao-agent-config
+  namespace: auth
+  labels:
+    app: svc-authcontroller
+    component: bao-config
+data:
+  agent.hcl: |
+    exit_after_auth = false
+    pid_file       = "/home/bao/authcontroller/pidfile"
+
+    vault {
+      address = "https://10.1.1.12:8200"  # Update as needed
+      tls_ca_file = "/etc/bao/ca/ca.crt"
+      tls_skip_verify = true
+      retry {
+        num_retries = 5
+        initial_backoff = "5s"
+        max_backoff = "30s"
+      }
+    }
+
+    auto_auth {
+      method "approle" {
+        mount_path = "auth/approle"
+        config = {
+          role_id_file_path        = "/etc/bao/authcontroller/role-id"
+          secret_id_file_path      = "/etc/bao/authcontroller/secret-id"
+          remove_secret_id_file_after_reading = false 
+          secret_id_refresh_interval = "10s"
+        }
+      }
+
+      sink "file" {
+        config = {
+          path = "/home/bao/authcontroller/token"
+          mode = 0640
+        }
+      }
+    }
+
+    cache {
+      persist = {
+        type = "kubernetes"
+        path = "/home/bao/authcontroller/cache"
+      }
+    }
+
+    listener "tcp" {
+      address     = "0.0.0.0:8100"
+      tls_disable = true
+    }
+    
+    api_proxy {
+      use_auto_auth_token = true
+    }
+
+    telemetry {
+      prometheus_retention_time = "10m"
+      disable_hostname = true
+    }
+
+    log_level = "info"
+    log_format = "json"

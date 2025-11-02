@@ -1,0 +1,15 @@
+---
+# PodDisruptionBudget to ensure availability during updates
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: svc-gateway-pdb
+  namespace: pulsar
+  labels:
+    app: svc-gatekeeper
+    component: availability
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: svc-gatekeeper

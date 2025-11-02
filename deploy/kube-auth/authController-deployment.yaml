@@ -1,0 +1,244 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc-authcontroller
+  namespace: auth
+  labels:
+    app: svc-authcontroller
+    version: v1.0.0
+    component: microservice
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: svc-authcontroller
+  template:
+    metadata:
+      labels:
+        app: svc-authcontroller
+        version: v1.0.0
+        component: microservice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: svc-authcontroller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+
+      volumes:
+      - name: authcontroller-config
+        configMap:
+          name: authcontroller-config
+
+      - name: authcontroller-bao-approle
+        projected:
+          sources:
+          - secret:
+              name: authcontroller-bao-approle
+              items:
+              - key: role-id
+                path: role-id
+              - key: secret-id
+                path: secret-id
+
+      - name: authcontroller-bao-agent-config
+        configMap:
+          name: authcontroller-bao-agent-config
+          items:
+          - key: agent.hcl
+            path: agent.hcl
+
+      - name: authcontroller-bao-agent-cache
+        emptyDir:
+          sizeLimit: "50Mi"
+
+      - name: authcontroller-bao-token
+        emptyDir: {}
+
+      # CA bundle for client Vault TLS connection (Vault Agent uses)
+      - name: openbao-ca
+        projected:
+          sources:
+          - secret:
+              name: openbao-ca-secret
+              items:
+              - key: ca.crt
+                path: ca.crt
+ 
+      - name: nats-ca-certs
+        emptyDir: {}
+  
+      - name: nats-client-certs
+        secret:
+          secretName: authcontroller-tls-credential
+          items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+
+      - name: avro-schemas
+        configMap:
+          name: avro-schemas 
+
+      - name: client-certs
+        emptyDir: {}
+
+      - name: temp-volume
+        emptyDir:
+          sizeLimit: 1Gi
+ 
+      - name: heapdump-volume
+        emptyDir:
+          sizeLimit: 2Gi
+
+      containers:
+      - name: authcontroller-vault-agent
+        image: openbao/openbao:latest  
+        imagePullPolicy: IfNotPresent
+
+        # Vault Agent runs as non-root
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+
+        volumeMounts:
+        - name: authcontroller-bao-approle
+          mountPath: /etc/bao/authcontroller        # contains role-id & secret-id
+
+        - name: authcontroller-bao-agent-config
+          mountPath: /etc/bao-agent   # contains agent.hcl
+          readOnly: true
+
+        - name: openbao-ca
+          mountPath: /etc/bao/ca
+          readOnly: true
+
+        - name: authcontroller-bao-token
+          mountPath: /home/bao/authcontroller        # agent writes token here
+
+        - name: authcontroller-bao-agent-cache
+          mountPath: /home/bao/authcontroller/cache  # cache persistence directory
+
+        command: ["bao", "agent", "-config=/etc/bao-agent/agent.hcl"]
+        env:
+        - name: VAULT_LOG_LEVEL
+          value: "info"
+      
+      - name: authcontroller
+        image: library/authcontroller:1.0
+        imagePullPolicy: IfNotPresent
+
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+
+        ports:
+        - containerPort: 8081
+          name: monitoring
+          protocol: TCP
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: JAVA_OPTS
+          value: "-Xms1g -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+#        livenessProbe:
+#          httpGet:
+#            path: /health
+#            port: 8081
+#          initialDelaySeconds: 60
+#          periodSeconds: 30
+#          timeoutSeconds: 10
+#          failureThreshold: 3
+#        readinessProbe:
+#          httpGet:
+#            path: /health
+#            port: 8081
+#          initialDelaySeconds: 30
+#          periodSeconds: 10
+#          timeoutSeconds: 5
+#          failureThreshold: 3
+#        startupProbe:
+#          httpGet:
+#            path: /health
+#            port: 8081
+#          initialDelaySeconds: 30
+#          periodSeconds: 10
+#          timeoutSeconds: 5
+#          failureThreshold: 12
+
+        volumeMounts:
+        - name: authcontroller-config
+          mountPath: /app/config
+          readOnly: true
+        - name: nats-ca-certs
+          mountPath: /app/certs/nats-ca-certs
+        - name: nats-client-certs
+          mountPath: "/app/certs/nats-client-certs"
+        - name: openbao-ca
+          mountPath: /app/openbao-ca
+        - name: avro-schemas
+          mountPath: /app/avro-schemas
+          readOnly: true
+        - name: authcontroller-bao-approle
+          mountPath: "/app/bao/authcontroller"
+        - name: authcontroller-bao-token
+          mountPath: /home/bao/authcontroller
+        - name: temp-volume
+          mountPath: /tmp
+        - name: heapdump-volume
+          mountPath: /app/heapdumps
+
+#      affinity:
+#        podAntiAffinity:
+#          preferredDuringSchedulingIgnoredDuringExecution:
+#          - weight: 100
+#            podAffinityTerm:
+#              labelSelector:
+#                matchExpressions:
+#                - key: app
+#                  operator: In
+#                  values:
+#                  - svc-authcontroller
+#              topologyKey: kubernetes.io/hostname
+#      tolerations:
+#      - key: "node.kubernetes.io/not-ready"
+#        operator: "Exists"
+#        effect: "NoExecute"
+#        tolerationSeconds: 300
+#      - key: "node.kubernetes.io/unreachable"
+#        operator: "Exists"
+#        effect: "NoExecute"
+#        tolerationSeconds: 300

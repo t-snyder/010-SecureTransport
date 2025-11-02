@@ -1,0 +1,32 @@
+# Use an official Java runtime as a parent image
+FROM eclipse-temurin:21-jre
+
+# Set working directory in the container
+WORKDIR /app
+
+# Create a non-root user to run the application
+RUN if ! getent group 1000 >/dev/null 2>&1; then \
+      groupadd -g 1000 watcher; \
+    fi && \
+    if ! getent passwd 1000 >/dev/null 2>&1; then \
+      grp=$(getent group 1000 | cut -d: -f1); \
+      useradd -u 1000 -r -g "$grp" -m -s /sbin/nologin watcher; \
+    fi && \
+    mkdir -p /app/certs /data /home/bao /app/logs && \
+    chown -R 1000:1000 /app /app/certs /data /home/bao /app/logs
+
+# Copy the JAR file into the container at /app
+COPY watcher-0.1.jar /app/watcher-0.1.jar
+
+# Set proper permissions
+RUN chown -R 1000:1000 /app
+
+# Switch to non-root user
+USER 1000:1000
+
+# Configure Java options if needed (memory, etc.)
+ENV JAVA_OPTS="-Xmx512m"
+
+# Run the jar file when the container launches
+CMD ["sh", "-c", "java $JAVA_OPTS -jar watcher-0.1.jar"]
+

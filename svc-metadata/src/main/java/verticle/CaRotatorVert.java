@@ -22,13 +22,11 @@ import core.model.service.TopicKey;
 import core.nats.NatsTLSClient;
 import core.service.DilithiumService;
 import core.transport.SignedMessage;
-import core.utils.CaRotationWindowManager;
+import core.utils.CAEpochUtil;
 import core.utils.KeyEpochUtil;
 
 import handler.MetadataVaultHandler;
 import helper.MetadataConfig;
-import utils.CAEpochUtil;
-import utils.RotationConfig;
 
 import java.nio.charset.StandardCharsets;
 //import java.nio.file.Files;
@@ -38,7 +36,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.Base64;
-import java.util.concurrent.TimeUnit;
+//import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -73,9 +71,8 @@ public class CaRotatorVert extends AbstractVerticle
   private final MetadataConfig   config;
   private final DilithiumService signer;
   private final KeySecretManager keyCache;
-  private final AesGcmHkdfCrypto aesCrypto = new AesGcmHkdfCrypto();
-  private final RotationConfig   rotationConfig;
-  private final CAEpochUtil      caEpoch;
+  private final AesGcmHkdfCrypto aesCrypto   = new AesGcmHkdfCrypto();
+  private final CAEpochUtil      caEpochUtil = new CAEpochUtil();
 
   private String namespace;
   private long   timerId = -1;
@@ -106,11 +103,8 @@ public class CaRotatorVert extends AbstractVerticle
     this.signer = signer;
     this.keyCache = keyCache;
 
-    this.rotationConfig = RotationConfig.fromConfig( this.config );
-    this.caEpoch        = new CAEpochUtil( rotationConfig );
-
     this.namespace = kubeClient.getNamespace();
-    LOGGER.info( "CaRotatorVert initialized in namespace: {} (rotationConfig={}) - using NATS", namespace, rotationConfig );
+    LOGGER.info( "CaRotatorVert initialized in namespace: {}", namespace );
   }
 
   @Override
@@ -127,7 +121,7 @@ public class CaRotatorVert extends AbstractVerticle
           startupTimerId = -1;
           LOGGER.info("Initial rotation delay elapsed ({} ms). Performing first rotation check.", initialDelayMs);
           doRotationCheck();
-          timerId = vertx.setPeriodic( rotationConfig.getCheckInterval().toMillis(), t -> doRotationCheck() );
+          timerId = vertx.setPeriodic( caEpochUtil.getCheckInterval().toMillis(), t -> doRotationCheck() );
       });
 
       LOGGER.info("CaRotatorVert started with NATS support (initialDelayMs={} ms)", initialDelayMs);
@@ -201,9 +195,9 @@ public class CaRotatorVert extends AbstractVerticle
       return;
     }
 
-    long currentEpoch = caEpoch.epochNumberForInstant( now );
-    boolean rotationNeeded = caEpoch.isRotationNeeded(now );
-    Instant rotationTime   = caEpoch.epochRotationTime( currentEpoch );
+    long    currentEpoch   = caEpochUtil.epochNumberForInstant( now );
+    boolean rotationNeeded = caEpochUtil.isRotationNeeded(now );
+    Instant rotationTime   = caEpochUtil.epochRotationTime( currentEpoch );
 
     LOGGER.info("CA Epoch Check: epoch={} rotationNeeded={} nextRotation={}", currentEpoch, rotationNeeded, rotationTime);
 
@@ -222,83 +216,112 @@ public class CaRotatorVert extends AbstractVerticle
   }
 
   /**
-   * Enhanced rotation with retry logic
+   * Enhanced rotation with retry logic. Stores the ca bundle in OpenBao
    */
-  private void performRotationWithRetry( long currentEpoch, int attemptCount )
+  private void performRotationWithRetry(long currentEpoch, int attemptCount)
   {
-    if( attemptCount >= MAX_ROTATION_RETRIES )
+    if (attemptCount >= MAX_ROTATION_RETRIES)
     {
-      LOGGER.error( "Maximum rotation attempts ({}) exceeded for epoch {}", MAX_ROTATION_RETRIES, currentEpoch );
-      CaRotationWindowManager.markRotationEnd();
+      LOGGER.error("Maximum rotation attempts ({}) exceeded for epoch {}", MAX_ROTATION_RETRIES, currentEpoch);
       return;
     }
 
-    // Enhanced start logging and window management
-    if( attemptCount == 0 )
+    if (attemptCount == 0)
     {
-      LOGGER.info( "=== STARTING CA ROTATION PROCESS WITH NATS ===" );
-      LOGGER.info( "CA Rotation Start - Epoch: {}, Time: {}", currentEpoch, Instant.now() );
-      LOGGER.info( "Rotation will affect all NATS connections in metadata service" );
-
-      // Set a longer rotation window for complex rotations
-      CaRotationWindowManager.setRotationWindow( Duration.ofMinutes( 5 ) );
-      CaRotationWindowManager.markRotationStart();
-      LOGGER.info( "CA rotation window activated - handshake errors will be suppressed" );
+      LOGGER.info("=== STARTING CA ROTATION PROCESS WITH NATS ===");
+      LOGGER.info("CA Rotation Start - Epoch: {}, Time: {}", currentEpoch, Instant.now());
     }
 
-    LOGGER.info( "CA Rotation Progress - Epoch: {}, Attempt: {}/{}", currentEpoch, attemptCount + 1, MAX_ROTATION_RETRIES );
+    LOGGER.info("CA Rotation Progress - Epoch: {}, Attempt: {}/{}", currentEpoch, attemptCount + 1, MAX_ROTATION_RETRIES);
 
-    performRotation().compose( newBundle -> {
-      return buildPublishedBundle( newBundle ).compose( mergedBundle -> {
-        return notifyLocalClientsWithValidation( mergedBundle ).compose( v -> {
-          return publishCARotationEventWithRetry( "NATS", mergedBundle, 0 );  // Changed from "Pulsar"
-        } );
-      } );
-    } ).onSuccess( result -> {
-      if( result != null )
-      {
+    performRotation()
+      // newBundle -> mergedBundle
+      .compose(newBundle -> buildPublishedBundle(newBundle))
+      // persistLocalCaBundle returns Future<Void>; map back to mergedBundle so next compose gets it
+      .compose(mergedBundle -> persistLocalCaBundle(mergedBundle).map(ignored -> mergedBundle))
+      // NEW: build local CaBundle
+      .compose(mergedBundle -> buildCaBundle("NATS", mergedBundle))
+      // NEW: Store CA bundle in Vault for bootstrap capability
+      .compose(caBundle -> {
+        LOGGER.info("Storing CA bundle in Vault for epoch {}", currentEpoch);
+        return metadataVaultHandler.putCaBundle("NATS", currentEpoch, caBundle)
+          .map(ignored -> caBundle)
+          .recover(err -> {
+            LOGGER.error("Failed to store CA bundle in Vault (non-fatal): {}", err.getMessage(), err);
+            // Continue with rotation even if Vault storage fails
+            return Future.succeededFuture(caBundle);
+          });
+      })
+      // Publish the CA rotation SignedMessage BEFORE we update our own client.
+      // This ensures the rotation message is sent while the existing (old) connection/consumers are still active.
+      .compose(caBundle -> publishCARotationEventWithRetry("NATS", caBundle.getCaBundle(), 0).map(ignored -> caBundle))
+      // After successfully publishing, update local client (apply new CA locally).
+      .compose(caBundle -> {
+        try {
+          return natsTLSClient.handleCaBundleUpdate(caBundle)
+            .recover(err -> {
+              LOGGER.warn("Local NATS client CA update failed (non-fatal): {}", err.getMessage());
+              return Future.succeededFuture();
+            })
+            .map(ignored -> caBundle);
+        } catch (Exception e) {
+          LOGGER.warn("Local NATS client CA update threw an exception (non-fatal): {}", e.getMessage());
+          return Future.succeededFuture(caBundle);
+        }
+      })
+      // NEW: Prune old CA bundles after successful rotation
+      .compose(caBundle -> {
+        // Keep last 3 CA bundles for overlap support
+        int keepLastN = caEpochUtil.getMaxCertsInBundle();
+        LOGGER.info("Pruning old CA bundles, keeping last {} bundles", keepLastN);
+        
+        return metadataVaultHandler.pruneOldCaBundles("NATS", keepLastN)
+          .map(deletedCount -> {
+            LOGGER.info("Pruned {} old CA bundles", deletedCount);
+            return caBundle;
+          })
+          .recover(err -> {
+            LOGGER.warn("Failed to prune old CA bundles (non-fatal): {}", err.getMessage());
+            return Future.succeededFuture(caBundle);
+          });
+      })
+      .onSuccess(result -> {
         lastRotatedEpoch = currentEpoch;
-        LOGGER.info( "Successfully completed CA rotation for epoch {} with NATS", currentEpoch );
+        LOGGER.info("Successfully completed CA rotation and storage for epoch {}", currentEpoch);
+      })
+      .onFailure(err -> {
+        String errorMsg = String.format("CA rotation attempt %d failed for epoch %d: %s", attemptCount + 1, currentEpoch, err.getMessage());
+        LOGGER.error(errorMsg, err);
 
-        // Keep rotation window active for a bit longer to allow all connections
-        // to stabilize
-        vertx.setTimer( 60000, id -> { // 1 minute additional grace period
-          CaRotationWindowManager.markRotationEnd();
-          LOGGER.info( "CA rotation window ended for epoch {}", currentEpoch );
-        } );
-      } else
-      {
-        LOGGER.info( "Rotation workflow completed without publishing a CaBundle; not marking epoch as rotated." );
-        CaRotationWindowManager.markRotationEnd();
-      }
-    } ).onFailure( err -> {
-      String errorMsg = String.format( "CA rotation attempt %d failed for epoch %d: %s", attemptCount + 1, currentEpoch, err.getMessage() );
-
-      // Use rotation-aware logging for rotation failures
-      if( CaRotationWindowManager.isRotationRelatedError( err.getMessage() ) )
-      {
-        LOGGER.warn( "CA rotation failed with rotation-related error: {}", errorMsg );
-      } else
-      {
-        LOGGER.error( "CA rotation failed with unexpected error: {}", errorMsg, err );
-      }
-
-      // Don't end rotation window on retry - keep it active
-      if( attemptCount >= MAX_ROTATION_RETRIES - 1 )
-      {
-        // Only end on final failure
-        CaRotationWindowManager.markRotationEnd();
-      }
-
-      // Schedule retry with exponential backoff
-      long retryDelayMs = ROTATION_RETRY_DELAY.toMillis() * ( 1L << attemptCount );
-      vertx.setTimer( retryDelayMs, id -> {
-        LOGGER.info( "Retrying CA rotation for epoch {} after {} ms delay", currentEpoch, retryDelayMs );
-        performRotationWithRetry( currentEpoch, attemptCount + 1 );
-      } );
-    } );
+        long retryDelayMs = ROTATION_RETRY_DELAY.toMillis() * (1L << attemptCount);
+        vertx.setTimer(retryDelayMs, id -> {
+          LOGGER.info("Retrying CA rotation for epoch {} after {} ms delay", currentEpoch, retryDelayMs);
+          performRotationWithRetry(currentEpoch, attemptCount + 1);
+        });
+      });
   }
+  
+  /**
+   * Persist the merged CA bundle locally (update secret and any local files).
+   * Returns Future<Void>.
+   */
+  private Future<Void> persistLocalCaBundle(String mergedBundle)
+  {
+    return workerExecutor.executeBlocking(() -> {
+      if (!isValidPemBundle(mergedBundle))
+      {
+        throw new RuntimeException("Invalid PEM format - cannot persist local CA bundle");
+      }
 
+      // updateLocalCaBundle is your existing method which writes/updates the local K8s secret
+      // and/or local file for this metadata instance.
+      updateLocalCaBundle(mergedBundle);
+
+      LOGGER.info("Persisted local CA bundle successfully (metadata local secret updated)");
+      return null;
+    });
+  }
+  
   /**
    * Enhanced rotation with better error handling - Updated for NATS
    */
@@ -334,7 +357,7 @@ public class CaRotatorVert extends AbstractVerticle
        LOGGER.info("Generated intermediate CSR (keyId={})", csrWithKey.getKeyId());
 
        // 3) Sign CSR with root (pem_bundle)
-       metadataVaultHandler.signCsrWithRoot(VAULT_ROOT_CA_PATH, csrWithKey.getCsr(), rotationConfig.buildCaTTLString())
+       metadataVaultHandler.signCsrWithRoot(VAULT_ROOT_CA_PATH, csrWithKey.getCsr(), caEpochUtil.buildCaTTLString())
          .onFailure(signErr -> {
            LOGGER.error("Failed to sign CSR with root", signErr);
            outerPromise.fail(signErr);
@@ -416,7 +439,7 @@ public class CaRotatorVert extends AbstractVerticle
   /**
    * Enhanced bundle building with better format handling
    */
-  private Future<String> buildPublishedBundle(String newBundle) {
+  private Future<String> buildPublishedBundle( String newBundle ) {
     return metadataVaultHandler.getCAChainEnhanced(VAULT_ROOT_CA_PATH)
       .recover(err -> {
         LOGGER.warn("Failed to get enhanced root CA chain, trying standard: {}", err.getMessage());
@@ -708,7 +731,6 @@ public class CaRotatorVert extends AbstractVerticle
 
   /**
    * Enhanced local client notification with validation - Updated for NATS
-   */
   private Future<Void> notifyLocalClientsWithValidation( String strBundle )
   {
     return workerExecutor.executeBlocking( () -> {
@@ -725,20 +747,21 @@ public class CaRotatorVert extends AbstractVerticle
       // 2. Build CaBundle and notify NatsTLSClient with enhanced validation
       if( natsTLSClient != null )
       {
-        return buildCaBundle( "NATS", strBundle ).compose( caBundle -> {  // Changed from "Pulsar"
-          // Enhanced rotation with connection pre-warming
-          return performEnhancedCARotation( caBundle, strBundle );
-        } );
+        return buildCaBundle( "NATS", strBundle )
+          .compose( caBundle -> 
+           {  
+             // Enhanced rotation with connection pre-warming
+             return performEnhancedCARotation( caBundle, strBundle );
+           });
       }
       return Future.succeededFuture();
     } );
   }
+   */
 
   /**
    * Enhanced CA rotation that minimizes connection disruption - Updated for NATS
-   */
   private Future<Void> performEnhancedCARotation( CaBundle caBundle, String strBundle )
-  {
     LOGGER.info( "Starting enhanced CA rotation with connection pre-warming for NATS" );
 
     return Future.succeededFuture().compose( v -> {
@@ -752,24 +775,24 @@ public class CaRotatorVert extends AbstractVerticle
           prewarmResult = prewarmFuture.toCompletionStage().toCompletableFuture().get( 5, TimeUnit.SECONDS );
         } catch( Exception e )
         {
-          // Use rotation-aware logging for prewarm failures
-          CaRotationWindowManager.logConnectionError( LOGGER, "Pre-warming failed, continuing with direct update", e );
+          LOGGER.error( "Pre-warming failed, continuing with direct update", e );
           prewarmResult = false;
         }
 
         if( prewarmResult )
         {
           LOGGER.info( "Pre-warming connections with new CA bundle succeeded" );
-        } else
+        } 
+        else
         {
           LOGGER.info( "Pre-warming connections with new CA bundle did not succeed or was skipped; proceeding with direct update" );
         }
 
         // Give pre-warming time to settle if desired
-        return waitForProcessing( 3000 );
+//        return waitForProcessing( 3000 );
       } catch( Exception e )
       {
-        CaRotationWindowManager.logConnectionError( LOGGER, "Pre-warming failed, continuing with direct update", e );
+        LOGGER.info( "Pre-warming failed, continuing with direct update", e );
         return Future.succeededFuture();
       }
     } ).compose( v -> {
@@ -779,13 +802,13 @@ public class CaRotatorVert extends AbstractVerticle
         Future<Void> updateFuture = natsTLSClient.handleCaBundleUpdate( caBundle );
         return updateFuture.recover( err -> {
           String errorMessage = "Failed to update NatsTLSClient CA bundle: " + err.getMessage();
-          CaRotationWindowManager.logConnectionError( LOGGER, errorMessage, err );
+          LOGGER.error( errorMessage, err );
           return Future.failedFuture( "NatsTLSClient CA update failed: " + err.getMessage() );
         } );
       } catch( Exception e )
       {
         String errorMessage = "Failed to update NatsTLSClient CA bundle: " + e.getMessage();
-        CaRotationWindowManager.logConnectionError( LOGGER, errorMessage, e );
+        LOGGER.error( errorMessage, e );
         return Future.failedFuture( "NatsTLSClient CA update failed: " + e.getMessage() );
       }
     } ).compose( v -> {
@@ -796,20 +819,20 @@ public class CaRotatorVert extends AbstractVerticle
       return performConnectionHealthCheck();
     } );
   }
+   */
 
   /**
    * Pre-warm connections with new CA bundle for NATS
-   */
   private Future<Boolean> preWarmConnectionsWithNewCA(String caBundle) {
     // This is a placeholder - implement according to your NATS client capabilities
     // NATS may handle this differently than Pulsar
     LOGGER.debug("NATS connection pre-warming not implemented, returning false");
     return Future.succeededFuture(false);
   }
+   */
   
   /**
    * Simple connection health check for NATS
-   */
   private Future<Void> performConnectionHealthCheck()
   {
     Promise<Void> promise = Promise.promise();
@@ -842,13 +865,14 @@ public class CaRotatorVert extends AbstractVerticle
     catch( Exception e )
     {
       vertx.cancelTimer( timerId );
-      CaRotationWindowManager.logConnectionError( LOGGER, "Health check failed, continuing anyway", e );
+      LOGGER.error( "Health check failed, continuing anyway", e );
       promise.complete();
     }
 
     return promise.future();
   }
-  
+ */
+ 
   /**
    * Enhanced CA rotation event publishing with retry - Updated for NATS
    */
@@ -956,20 +980,22 @@ public class CaRotatorVert extends AbstractVerticle
 
                   LOGGER.info( "Successfully generated and encrypted CaBundle for server: {}", serverId );
 
-                  SignedMessage signedMsg = new SignedMessage(
-                    serverId + Instant.now().toString(),
-                    "CaBundle",
-                    "metadata",
-                    signKey.getEpochNumber(),
-                    Instant.now(),
-                    signature,
-                    ServiceCoreIF.MetaDataClientCaCertStream,  // Updated
-                    topicKey.getKeyId(),
-                    "CaBundle",
-                    encData.serialize()
-                  );
-                  return signedMsg;
-                })
+                  Instant now      = Instant.now();
+                  long    caEpoch  = caEpochUtil.epochNumberForInstant(  now );
+
+                  return new SignedMessage( serverId + now.toString(),
+                      "CaBundle",
+                      caEpoch,
+                      keyEpoch,
+                      "metadata",
+                      signKey.getEpochNumber(),
+                      now,
+                      signature,
+                      ServiceCoreIF.MetaDataClientCaCertStream,
+                      topicKey.getKeyId(),
+                      "CaBundle",
+                      encData.serialize());
+                 })
               )
             )
       )
@@ -988,7 +1014,7 @@ public class CaRotatorVert extends AbstractVerticle
     {
       Instant timestamp  = Instant.now();
       String  caVersion  = timestamp.toString();
-      long    caEpochNum = caEpoch.epochNumberForInstant( timestamp );
+      long    caEpochNum = caEpochUtil.epochNumberForInstant( timestamp );
 
       CaBundle bundle = new CaBundle( serverId, timestamp, caEpochNum, ServiceCoreIF.CaRotationEvent, caBundle, caVersion);
       return bundle;

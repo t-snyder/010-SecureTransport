@@ -4,6 +4,7 @@ package acl;
 import core.model.ServiceBundle;
 import core.model.service.TopicKey;
 import core.model.service.TopicPermission;
+import core.utils.KeyEpochUtil;
 import service.ServiceDilithiumKeyStore;
 import service.TopicKeyStore;
 import core.model.DilithiumKey;
@@ -38,9 +39,10 @@ public class ServiceBundleManager
   {
     return workerExecutor.executeBlocking( () -> 
     {
-      Instant now     = Instant.now();
-      String  version = String.valueOf( now.toEpochMilli() );
-
+      Instant now      = Instant.now();
+      String  version  = String.valueOf( now.toEpochMilli() );
+      long    keyEpoch = KeyEpochUtil.epochNumberForInstant( now );
+      
       // --- Assemble all maps before ServiceBundle construction ---
 
       // 1. TopicPermissions
@@ -93,7 +95,7 @@ public class ServiceBundleManager
       }
       
       // Construct the immutable ServiceBundle with all maps:
-      return new ServiceBundle( serviceId, version, updateType, now, "current", signingKeys, verifyKeys, topicKeys, topicPermissions );
+      return new ServiceBundle( serviceId, version, keyEpoch, updateType, now, "current", signingKeys, verifyKeys, topicKeys, topicPermissions );
     });
   }
 

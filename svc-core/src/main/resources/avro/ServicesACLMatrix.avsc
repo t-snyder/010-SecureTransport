@@ -1,0 +1,20 @@
+{
+  "type": "record",
+  "name": "ServicesACLMatrix",
+  "namespace": "acl",
+  "fields": [
+    {
+      "name": "serviceTopicPermissions",
+      "type": {
+        "type": "map",
+        "values": {
+          "type": "map",
+          "values": {
+            "type": "array",
+            "items": "string"
+          }
+        }
+      }
+    }
+  ]
+}

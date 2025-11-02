@@ -1,0 +1,28 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: metadata-nats-client-tls
+  namespace: metadata
+spec:
+  secretName: metadata-nats-client-tls
+  issuerRef:
+    name: metadata-tls-issuer
+    kind: Issuer
+  # CRITICAL: This CN must match the user in NATS authorization config
+  commonName: metadata
+  dnsNames:
+  - metadata
+  - metadata-service
+  - metadata.metadata.svc.cluster.local
+  - metadata-service.metadata.svc.cluster.local
+  duration: 12h
+  renewBefore: 2h
+  privateKey:
+    algorithm: RSA
+    size: 4096
+    rotationPolicy: Always
+  usages:
+  - digital signature
+  - key encipherment
+  - client auth
+

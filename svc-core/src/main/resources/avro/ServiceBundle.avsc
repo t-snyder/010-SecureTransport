@@ -1,0 +1,38 @@
+{
+  "type": "record",
+  "name": "ServiceBundle",
+  "namespace": "core.model",
+  "fields": [
+    { "name": "serviceId",   "type": "string" },
+    { "name": "version",     "type": "string" },
+    { "name": "keyEpoch",    "type": "long"   },
+    { "name": "updateType",  "type": "string" },
+    { "name": "createdAt",   "type": "string" },
+    { "name": "status",      "type": "string", "default": "current" },
+
+    { "name": "signingKeys", "type": { "type": "map", "values": "bytes" }, "default": {} },
+
+    { "name": "verifyKeys",  "type": {
+      "type": "map",
+      "values": { "type": "map", "values": "bytes" }
+    }, "default": {} },
+
+    { "name": "topicKeys", "type": {
+      "type": "map",
+      "values": { "type": "map", "values": "bytes" }
+    }, "default": {} },
+
+    { "name": "topicPermissions", "type": {
+      "type": "map",
+      "values": {
+        "type": "record",
+        "name": "TopicPermissionRecord",
+        "fields": [
+          { "name": "topicName",          "type": "string"  },
+          { "name": "producePermission",  "type": "boolean" },
+          { "name": "consumePermission",  "type": "boolean" }
+        ]
+      }
+    }, "default": {} }
+  ]
+}

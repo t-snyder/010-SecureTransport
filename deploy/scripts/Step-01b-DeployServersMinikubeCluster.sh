@@ -78,8 +78,8 @@ helm install cert-manager jetstack/cert-manager \
   --set config.enableGatewayAPI=true  
 
 # Create pulsar namespace (fresh)
-echo "-> Creating pulsar namespace..."
-kubectl --context="$CLUSTER" create namespace pulsar --dry-run=client -o yaml | kubectl --context="$CLUSTER" apply -f -
+echo "-> Creating nats namespace..."
+kubectl --context="$CLUSTER" create namespace nats --dry-run=client -o yaml | kubectl --context="$CLUSTER" apply -f -
 
 echo "=== Minikube profile '$CLUSTER' is ready with dashboard, metallb, Gateway API CRDs, Istio (ambient), and cert-manager installed. ==="
 

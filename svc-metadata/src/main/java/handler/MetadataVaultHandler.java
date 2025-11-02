@@ -6,6 +6,7 @@ import io.vertx.core.WorkerExecutor;
 import io.vertx.core.Promise;
 import io.vertx.core.CompositeFuture;
 import io.vertx.core.json.JsonObject;
+import io.vertx.ext.web.codec.BodyCodec;
 import io.vertx.core.json.JsonArray;
 
 import java.io.ByteArrayInputStream;
@@ -17,6 +18,7 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -26,6 +28,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import core.handler.VaultAccessHandler;
+import core.model.CaBundle;
+import core.model.ServiceBundle;
 
 /**
  * Specialized Vault handler for Metadata service operations. Pre-collects existing
@@ -41,6 +45,10 @@ public class MetadataVaultHandler
 
   // Vault paths
   private static final String METADATA_PKI_PATH = "metadata_pki";
+ 
+  // Vault service bundle paths
+  private static final String SERVICE_BUNDLE_VAULT_MOUNT = "secret";
+  private static final String SERVICE_BUNDLE_VAULT_PATH_PREFIX = "service-bundles";
 
   private final Vertx vertx;
   private final VaultAccessHandler vaultHandler;
@@ -569,75 +577,180 @@ public class MetadataVaultHandler
     return count;
   }
 
-  /* =========================
-   * KV v2 Helpers
-   * ========================= */
-  
-  public Future<String> readKvV2( String mount, String path, String key ) 
-  {
-    final String apiUrl = "/v1/" + mount + "/data/" + path;
-    return vaultHandler.vaultRequest( "GET", apiUrl, null )
-      .compose( json -> 
-      {
-        try 
-        {
-          if( json == null || json.isEmpty() ) 
-          {
-            return Future.failedFuture("Empty response for KV read");
-          }
-          JsonObject dataOuter = json.getJsonObject("data");
-          if( dataOuter == null ) 
-          {
-            return Future.failedFuture("KV v2 read missing 'data' object");
-          }
-          JsonObject dataInner = dataOuter.getJsonObject("data");
-          if( dataInner == null ) 
-          {
-            return Future.failedFuture("KV v2 read missing inner 'data' object");
-          }
-          if( !dataInner.containsKey( key ))
-          {
-            return Future.failedFuture("KV v2 key '" + key + "' not present");
-          }
-          String val = dataInner.getString(key);
-          return Future.succeededFuture(val);
-        } 
-        catch( Exception e ) 
-        {
-          return Future.failedFuture(e);
-        }
-      });
-  }
+  /** 
+   * Store a ServiceBundle for a given serviceId and epoch.
+   * Vault path: secret/data/service-bundles/{serviceId}/{epoch}
+   */
+  public Future<Void> putServiceBundle(String serviceId, long epoch, ServiceBundle bundle) {
+    String path   = String.format("%s/%s/%d", SERVICE_BUNDLE_VAULT_PATH_PREFIX, serviceId, epoch);
+    String apiUrl = "/v1/" + SERVICE_BUNDLE_VAULT_MOUNT + "/data/" + path;
 
-  public Future<Void> putKvV2( String mount, String path, Map<String, String> data ) 
-  {
-    final String apiUrl = "/v1/" + mount + "/data/" + path;
-
-    JsonObject inner = new JsonObject();
-    if( data != null && !data.isEmpty() ) 
+    return workerExecutor.executeBlocking(() -> 
     {
-      data.forEach(inner::put);
-    }
+        byte[] avroBytes = ServiceBundle.serialize(bundle);
+        String base64Bundle = Base64.getEncoder().encodeToString(avroBytes);
+        JsonObject inner = new JsonObject()
+            .put("bundle", base64Bundle)
+            .put("version", bundle.getVersion())
+            .put("updateType", bundle.getUpdateType())
+            .put("createdAt", bundle.getCreatedAt().toString())
+            .put("status", bundle.getStatus())
+            .put("format", "avro");
+        JsonObject payload = new JsonObject().put("data", inner);
+        return payload;
+    }).compose(payload ->
+        vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
+    ).mapEmpty();
+  }
 
-    JsonObject payload = new JsonObject().put("data", inner);
+  public Future<Void> deleteServiceBundle(String serviceId, long epoch) 
+  {
+    String path   = String.format("%s/%s/%d", SERVICE_BUNDLE_VAULT_PATH_PREFIX, serviceId, epoch);
+    String apiUrl = "/v1/" + SERVICE_BUNDLE_VAULT_MOUNT + "/metadata/" + path;
+    return vaultHandler.vaultRequest("DELETE", apiUrl, null).mapEmpty();
+  }
 
-    return vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
-      .map( v -> 
+  
+  /**
+   * Store a CaBundle for a given serverId and CA epoch.
+   * Vault path: secret/data/ca-bundles/{serverId}/{caEpoch}
+   */
+  public Future<Void> putCaBundle(String serverId, long caEpoch, CaBundle bundle) {
+    String path = String.format("ca-bundles/%s/%d", serverId, caEpoch);
+    String apiUrl = "/v1/" + SERVICE_BUNDLE_VAULT_MOUNT + "/data/" + path;
+
+    return workerExecutor.executeBlocking(() -> 
+    {
+      try 
       {
-        LOGGER.info("KV v2 write succeeded for {}/{}", mount, path);
-        return null;
+        byte[] avroBytes = CaBundle.serialize(bundle);
+        String base64Bundle = Base64.getEncoder().encodeToString(avroBytes);
+        
+        JsonObject inner = new JsonObject()
+          .put("bundle",    base64Bundle)
+          .put("serverId",  bundle.getServerId())
+          .put("caEpoch",   bundle.getCaEpochNumber())
+          .put("eventType", bundle.getEventType())
+          .put("caVersion", bundle.getCaVersion())
+          .put("timestamp", bundle.getTimestamp().toString())
+          .put("format", "avro");
+        
+        JsonObject payload = new JsonObject().put("data", inner);
+        return payload;
+      } 
+      catch( Exception e ) 
+      {
+        LOGGER.error("Failed to serialize CaBundle for storage: {}", e.getMessage(), e);
+        throw new RuntimeException("Failed to serialize CaBundle", e);
+      }
+    }).compose(payload ->
+      vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
+    ).mapEmpty();
+  }
+
+  /**
+   * Delete a CaBundle for a given serverId and CA epoch.
+   * Vault path: secret/metadata/ca-bundles/{serverId}/{caEpoch}
+   */
+  public Future<Void> deleteCaBundle(String serverId, long caEpoch) 
+  {
+    String path = String.format("ca-bundles/%s/%d", serverId, caEpoch);
+    String apiUrl = "/v1/" + SERVICE_BUNDLE_VAULT_MOUNT + "/metadata/" + path;
+    
+    LOGGER.info("Deleting CaBundle for server {} at epoch {} from path: {}", serverId, caEpoch, path);
+    
+    return vaultHandler.vaultRequest("DELETE", apiUrl, null).mapEmpty();
+  }
+
+  /**
+   * List all CA epoch keys for a serverId.
+   * Vault path: secret/metadata/ca-bundles/{serverId}
+   */
+  public Future<List<Long>> listCaBundleEpochs(String serverId)
+  {
+    String path = String.format("ca-bundles/%s", serverId);
+    String apiUrl = "/v1/" + SERVICE_BUNDLE_VAULT_MOUNT + "/metadata/" + path;
+
+    return vaultHandler.vaultRequest("LIST", apiUrl, null)
+      .map(response -> {
+        JsonObject data = response.getJsonObject("data");
+        if (data == null) {
+          LOGGER.debug("No data field in LIST ca-bundles response for server {}", serverId);
+          return new ArrayList<Long>();
+        }
+        
+        JsonArray keysArray = data.getJsonArray("keys");
+        if (keysArray == null) {
+          LOGGER.debug("No keys array in LIST ca-bundles response for server {}", serverId);
+          return new ArrayList<Long>();
+        }
+        
+        List<Long> epochs = new ArrayList<>();
+        for (int i = 0; i < keysArray.size(); i++) {
+          String key = keysArray.getString(i);
+          if (key.endsWith("/")) {
+            key = key.substring(0, key.length() - 1);
+          }
+          try {
+            epochs.add(Long.parseLong(key));
+          } catch (NumberFormatException e) {
+            LOGGER.warn("Ignoring invalid CA epoch key: {}", key);
+          }
+        }
+        
+        LOGGER.debug("Found {} CA epochs for server {}", epochs.size(), serverId);
+        return epochs;
+      })
+      .recover(err -> {
+        LOGGER.warn("Failed to list CA bundle epochs for {}: {}", serverId, err.getMessage());
+        return Future.succeededFuture(new ArrayList<Long>());
       });
   }
 
-  public Future<Void> putKvV2( String mount, String path, JsonObject data ) 
-  {
-    final String apiUrl  = "/v1/" + mount + "/data/" + path;
-    JsonObject   payload = new JsonObject().put("data", data != null ? data : new JsonObject());
-    return vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
-      .map(v -> 
-      {
-        LOGGER.info("KV v2 write (JsonObject) succeeded for {}/{}", mount, path);
-        return null;
+  /**
+   * Prune old CA bundles, keeping only the last N epochs.
+   * This helps manage Vault storage and prevents accumulation of expired CA bundles.
+   * 
+   * @param serverId The server ID (e.g., "NATS", "metadata")
+   * @param keepLastN Number of most recent CA bundles to keep
+   * @return Future with count of deleted bundles
+   */
+  public Future<Integer> pruneOldCaBundles(String serverId, int keepLastN) {
+    final int keep = Math.max(1, keepLastN);
+    
+    return listCaBundleEpochs(serverId)
+      .compose(epochs -> {
+        if (epochs == null || epochs.size() <= keep) {
+          LOGGER.info("No CA bundles to prune for server {} (found {}, keeping {})", 
+                     serverId, epochs != null ? epochs.size() : 0, keep);
+          return Future.succeededFuture(0);
+        }
+        
+        // Sort epochs in ascending order (oldest first)
+        Collections.sort(epochs);
+        
+        int toDelete = epochs.size() - keep;
+        List<Future<?>> deletes = new ArrayList<>();
+        
+        // Delete the oldest bundles
+        for (int i = 0; i < toDelete; i++) {
+          Long epoch = epochs.get(i);
+          LOGGER.info("Pruning old CA bundle for server {} at epoch {}", serverId, epoch);
+          
+          // Recover from individual delete failures to avoid short-circuiting
+          deletes.add(deleteCaBundle(serverId, epoch).recover(err -> {
+            LOGGER.warn("Failed to delete CA bundle for server {} at epoch {}: {}", 
+                       serverId, epoch, err.getMessage());
+            return Future.succeededFuture((Void) null);
+          }));
+        }
+        
+        return Future.all(deletes)
+          .map(cf -> {
+            LOGGER.info("CA bundle pruning completed for server {}: deleted {} bundles, kept {}", 
+                       serverId, toDelete, keep);
+            return toDelete;
+          });
       });
   }
   
@@ -747,7 +860,6 @@ public class MetadataVaultHandler
    * Each ack is expected to contain key "bundle_hash" with the sha256 of the published bundle.
    *
    * This will poll (with backoff) for the presence of all expected acks or fail on timeout.
-   */
   public Future<Void> waitForClusterAcks(String expectedBundleHash, List<String> clusterIds, long timeoutMs) {
     Promise<Void> promise = Promise.promise();
     if (clusterIds == null || clusterIds.isEmpty()) {
@@ -811,6 +923,7 @@ public class MetadataVaultHandler
     new Poll().run(initialDelay);
     return promise.future();
   }
+   */
 
   /**
    * Best-effort delete issuer entry in the PKI mount.

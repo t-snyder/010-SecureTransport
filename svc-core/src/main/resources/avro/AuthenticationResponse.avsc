@@ -1,0 +1,19 @@
+{
+  "namespace" : "core.model",
+  "type" : "record",
+  "name" : "AuthenticationResponse",
+  "fields" : 
+  [
+    { "name" : "Oid",                  "type" : "string" },
+    { "name" : "UserToken",            "type" : "string" },
+    { "name" : "PasswordHash",         "type" : "string" },
+    { "name" : "IdentityToken",        "type" : "string" },
+    { "name" : "IdentitySymmKey",      "type" : "bytes"  },
+    { "name" : "IdentityIVSpec",       "type" : "bytes"  },
+    { "name" : "AuthorizationToken",   "type" : "string" },
+    { "name" : "AuthorizationSymmKey", "type" : "bytes"  },
+    { "name" : "AuthorizationIVSpec",  "type" : "bytes"  },
+    { "name" : "AccountStatus",        "type" : "string" },
+    { "name" : "MemberLevelCode",      "type" : "string" }
+  ]
+}

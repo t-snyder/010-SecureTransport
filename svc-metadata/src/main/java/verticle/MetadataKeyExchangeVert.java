@@ -20,6 +20,7 @@ import core.transport.SignedMessage;
 import core.model.DilithiumKey;
 
 import io.nats.client.Subscription;
+import io.nats.client.JetStreamSubscription;
 import io.nats.client.Message;
 import io.nats.client.MessageHandler;
 import org.bouncycastle.jcajce.SecretKeyWithEncapsulation;
@@ -28,6 +29,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.security.PublicKey;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -52,7 +55,7 @@ public class MetadataKeyExchangeVert extends AbstractVerticle
   private SignedMessageProcessor    signedMessageProcessor;
     
   //Request queuing for startup coordination
-  private final AtomicBoolean          metadataServiceReady = new AtomicBoolean(false);
+  private final AtomicBoolean  metadataServiceReady = new AtomicBoolean(false);
   private final Queue<Message> queuedRequests       = new ConcurrentLinkedQueue<>();
 
   private static final int MAX_QUEUED_REQUESTS = 100; // Prevent memory issues
@@ -194,8 +197,7 @@ public class MetadataKeyExchangeVert extends AbstractVerticle
   }
   
   @Override
-  public void stop()
-   throws Exception
+  public void stop() throws Exception
   {
     LOGGER.info( "Stopping Metadata Key Exchange Vert" );
 
@@ -208,11 +210,18 @@ public class MetadataKeyExchangeVert extends AbstractVerticle
     }
     
     if( workerExecutor != null ) workerExecutor.close();
-    if( keyConsumer != null && keyConsumer.isActive() ) keyConsumer.unsubscribe();
+    if( keyConsumer != null ) {
+      try {
+        if (keyConsumer instanceof JetStreamSubscription) {
+          try { ((JetStreamSubscription)keyConsumer).drain( Duration.ofSeconds(2) ); } catch (Exception ignore) {}
+        }
+      } catch (Exception ignore) {}
+      try { if (keyConsumer.isActive()) keyConsumer.unsubscribe(); } catch (Exception ignore) {}
+    }
 
     LOGGER.info( "Metadata Key Exchange Vert stopped" );
   }
-   
+  
   /**
    * Message handler for key exchange responses
    */
@@ -273,35 +282,40 @@ public class MetadataKeyExchangeVert extends AbstractVerticle
  
   private Future<Void> startKeyExchConsumer()
   {
-    LOGGER.info("MetadataKeyExchangeVert.startKeyExchConsumer() - Starting key exchange consumer");
+    LOGGER.info( "MetadataKeyExchangeVert.startKeyExchConsumer() - Starting key exchange consumer" );
     Promise<Void> promise = Promise.promise();
     MessageHandler keyMsgHandler = createKeyExchangeMessageHandler();
-    String subject = ServiceCoreIF.KeyExchangeStreamBase + serviceId;  // Updated for JetStream naming
+    String subject = ServiceCoreIF.KeyExchangeStreamBase + serviceId; // subject for key exchange
+    String durable = serviceId + "-key-exch-consumer";
 
-    // Use the pooled consumer from NatsTLSClient
-    natsTlsClient.getConsumerPoolManager()
-      .getOrCreateConsumer(subject, serviceId + "-key-exch-consumer", keyMsgHandler)
-      .onSuccess( consumer -> 
+    natsTlsClient.attachPushQueue(subject, durable, keyMsgHandler )
+    .onSuccess( sub ->
+     {
+       this.keyConsumer = sub;
+       if (sub instanceof io.nats.client.JetStreamSubscription)
        {
-         this.keyConsumer = consumer;
-         LOGGER.info("Key exchange consumer pooled and subscribed to subject: {}", subject );
-         promise.complete();
-       })
-      .onFailure( e -> 
+         LOGGER.info("Key exchange consumer attached (JetStreamSubscription): subject={} queueGroup={}", subject, durable);
+       }
+       else
        {
-         LOGGER.error("Consumer creation exception. Error = - " + e.getMessage());
-         promise.fail(e);
-       });
-
+         LOGGER.info("Key exchange consumer attached (plain NATS Subscription): subject={} queueGroup={}", subject, durable);
+       }
+       promise.complete();
+      })
+    .onFailure( e -> 
+     {
+       LOGGER.error("Failed to attach key-exchange consumer: {}", e.getMessage(), e);
+       promise.fail(e);
+     });
+    
     return promise.future();
   }
-
 
   private void handleKeyExchangeMsg( Message msg ) 
    throws Exception
   {
     LOGGER.info( "========================================================================" );
-    LOGGER.info( "MetadataKeyExchangeVert.handleKeyExchangeMsg received msg." );
+    LOGGER.info( "MetadataKeyExchangeVert.handleKeyExchangeMsg received msg at " + Instant.now(),toString() );
 
     KyberExchangeMessage kyberMsg = KyberExchangeMessage.deSerialize( msg.getData() );
     if( kyberMsg == null )

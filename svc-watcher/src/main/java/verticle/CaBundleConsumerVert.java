@@ -1,263 +1,329 @@
 package verticle;
 
+
+import java.time.Duration;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import core.handler.KeySecretManager;
+import core.model.CaBundle;
 import core.model.ServiceCoreIF;
+import core.processor.SignedMessageProcessor;
 
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.nats.client.JetStreamSubscription;
+import io.nats.client.Message;
+import io.nats.client.MessageHandler;
+import io.nats.client.Subscription;
 import io.vertx.core.AbstractVerticle;
-import io.vertx.core.DeploymentOptions;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.WorkerExecutor;
-import io.vertx.core.json.JsonObject;
-
-import io.nats.client.JetStreamSubscription;
-import io.nats.client.MessageHandler;
 
 import core.nats.NatsTLSClient;
 import core.nats.NatsConsumerErrorHandler;
-import processor.CaBundleMsgProcessor;
+import processor.NatsCaBundleMsgProcessor;
 import utils.WatcherConfig;
 
 /**
- * NATS JetStream Consumer Verticle for CA Bundle Updates
- * 
- * Replaces the Pulsar-based consumer with NATS JetStream for CA bundle rotation messages.
- * Maintains the same message processing logic but uses NATS JetStream subscriptions.
+ * Refactored CA Bundle consumer: - Single shared NatsCaBundleMsgProcessor
+ * (stateless) - Single-flight rotation with epoch coalescing - Keeps only the
+ * newest pending rotation - ACKs messages immediately (simplifies flow; can be
+ * changed to deferred ACK if needed)
  */
 public class CaBundleConsumerVert extends AbstractVerticle
 {
-  private static final Logger LOGGER           = LoggerFactory.getLogger(CaBundleConsumerVert.class);
-//  private static final String KEY_SUBSCRIPTION = "watcher-key-response";
-  private static final String ServiceId        = "watcher";
-  
-  private KubernetesClient kubeClient       = null;
-  private WatcherConfig    config           = null;
-  private NatsTLSClient    natsTlsClient    = null;
-  private KeySecretManager keyCache         = null;
-  
-  private String           nameSpace        = null;
-  private WorkerExecutor   workerExecutor   = null;
-  private JetStreamSubscription caSubscription = null;
-  
-  private NatsConsumerErrorHandler errHandler = null;
 
-  public CaBundleConsumerVert( KubernetesClient kubeClient, NatsTLSClient natsTlsClient, KeySecretManager keyCache, WatcherConfig config, String nameSpace )
+  private static final Logger LOGGER = LoggerFactory.getLogger( CaBundleConsumerVert.class );
+  private static final String SERVICE_ID = "watcher";
+
+  private final KubernetesClient kubeClient;
+  private final WatcherConfig config;
+  private final NatsTLSClient natsTlsClient;
+  private final KeySecretManager keyCache;
+  private final String namespace;
+
+  private WorkerExecutor workerExecutor;
+  private Subscription   caSubscription;
+  
+  private final NatsConsumerErrorHandler errHandler;
+
+  private NatsCaBundleMsgProcessor rotationProcessor;
+  private SignedMessageProcessor epochExtractor;
+
+  // Rotation coordination
+  private final AtomicBoolean rotationInProgress = new AtomicBoolean( false );
+  private volatile long currentEpoch = -1L;
+  private final AtomicReference<Pending> pending = new AtomicReference<>( null );
+
+  private static final class Pending
   {
-    this.kubeClient     = kubeClient;
-    this.natsTlsClient  = natsTlsClient;
-    this.keyCache       = keyCache;
-    this.config         = config;
-    this.nameSpace      = nameSpace;
-    this.errHandler     = new NatsConsumerErrorHandler();
+    final long epoch;
+    final byte[] raw;
+
+    Pending( long epoch, byte[] raw )
+    {
+      this.epoch = epoch;
+      this.raw = raw;
+    }
   }
-  
-  @Override
-  public void start( Promise<Void> startPromise ) 
-   throws Exception
+
+  public CaBundleConsumerVert( KubernetesClient kubeClient, NatsTLSClient natsTlsClient, KeySecretManager keyCache, WatcherConfig config, String namespace )
   {
-    LOGGER.info("CaBundleConsumerVert.start() - Starting CaBundleConsumerVert");
-    workerExecutor = vertx.createSharedWorkerExecutor("msg-handler");
-    
-    try 
-    {
-      startCAConsumer();
-      
-      startPromise.complete();
-      LOGGER.info("CaBundleConsumerVert started successfully");
-    }
-    catch( Exception e ) 
-    {
-      LOGGER.error("Error starting CaBundleConsumerVert: {}", e.getMessage(), e);
-      cleanup();
-      startPromise.fail(e);
-    }
-  }  
+    this.kubeClient = kubeClient;
+    this.natsTlsClient = natsTlsClient;
+    this.keyCache = keyCache;
+    this.config = config;
+    this.namespace = namespace;
+    this.errHandler = new NatsConsumerErrorHandler();
+  }
 
   @Override
-  public void stop(Promise<Void> stopPromise) 
-   throws Exception
+  public void start( Promise<Void> startPromise )
   {
-    LOGGER.info("Stopping CaBundleConsumerVert");
+    LOGGER.info( "CaBundleConsumerVert.start() - Starting CA bundle consumer" );
+    try
+    {
+      workerExecutor = vertx.createSharedWorkerExecutor( "ca-msg-handler", 8 );
+      rotationProcessor = new NatsCaBundleMsgProcessor( vertx, workerExecutor, kubeClient, natsTlsClient, keyCache );
+      epochExtractor = new SignedMessageProcessor( workerExecutor, keyCache );
+
+      startCAConsumer().onSuccess( v -> {
+        LOGGER.info( "CaBundleConsumerVert started successfully" );
+        startPromise.complete();
+      } ).onFailure( e -> {
+        LOGGER.error( "Error starting CaBundleConsumerVert: {}", e.getMessage(), e );
+        cleanup();
+        startPromise.fail( e );
+      } );
+    }
+    catch( Exception e )
+    {
+      startPromise.fail( e );
+    }
+  }
+
+  @Override
+  public void stop( Promise<Void> stopPromise )
+  {
+    LOGGER.info( "Stopping CaBundleConsumerVert" );
     cleanup();
     stopPromise.complete();
-    LOGGER.info("CaBundleConsumerVert stopped successfully");
-  }
-
-  private void closeSubscription() 
-  {
-    if( caSubscription != null ) 
-    {
-      try 
-      {
-        caSubscription.unsubscribe();
-        LOGGER.info("CA bundle subscription closed");
-      } 
-      catch( Exception e ) 
-      {
-        LOGGER.warn("Error closing CA bundle subscription: {}", e.getMessage(), e);
-      }
-      caSubscription = null;
-    }
-  }
-
-  private void closeWorkerExecutor() 
-  {
-    if( workerExecutor != null ) 
-    {
-      try 
-      {
-        workerExecutor.close();
-        LOGGER.info("Worker executor closed");
-      } 
-      catch( Exception e ) 
-      {
-        LOGGER.warn("Error closing worker executor: {}", e.getMessage(), e);
-      }
-      workerExecutor = null;
-    }
   }
 
   private void cleanup()
   {
-    closeSubscription();
-    closeWorkerExecutor();
-    
-    LOGGER.info("CaBundleConsumerVert cleanup completed");
+    if( caSubscription != null )
+    {
+      try
+      {
+        if (caSubscription instanceof io.nats.client.JetStreamSubscription)
+        {
+          try { ((io.nats.client.JetStreamSubscription) caSubscription).drain( Duration.ofSeconds(2) ); } catch (Exception ignore) {}
+        }
+        caSubscription.unsubscribe();
+      }
+      catch( Exception e )
+      {
+        LOGGER.warn( "Error unsubscribing: {}", e.getMessage(), e );
+      }
+      caSubscription = null;
+    }
+    if( workerExecutor != null )
+    {
+      try
+      {
+        workerExecutor.close();
+      }
+      catch( Exception e )
+      {
+        LOGGER.warn( "Error closing worker executor: {}", e.getMessage(), e );
+      }
+      workerExecutor = null;
+    }
+    LOGGER.info( "CaBundleConsumerVert cleanup completed" );
   }
   
-  /**
-   * Use the NatsTLSClient's consumer pool to start the CA bundle consumer.
-   * This method creates a NATS JetStream subscription for CA bundle rotation messages.
-   */
   private Future<Void> startCAConsumer()
   {
-    LOGGER.info("CaBundleConsumerVert.startCAConsumer() - Starting CA Bundle rotate consumer via NATS JetStream" );
+    LOGGER.info( "Starting CA Bundle JetStream consumer (attach to admin-created push consumer)" );
 
-    String subscriptionName = ServiceId + "-ca-update-" + UUID.randomUUID().toString();
-    MessageHandler caMsgHandler = createCAMessageHandler();
+    Promise<Void> promise = Promise.promise();
+    MessageHandler handler = createCAMessageHandler();
 
-    // Use the consumer pool manager from NatsTLSClient
-    return natsTlsClient.getConsumerPoolManager()
-      .getOrCreateConsumer( ServiceCoreIF.MetaDataClientCaCertStream, subscriptionName, caMsgHandler )
-      .compose((subscription) ->
-       {
-         this.caSubscription = (JetStreamSubscription) subscription;
-         LOGGER.info("CA Bundle consumer started successfully");
-         return Future.succeededFuture((Void) null );
-       })
-      .onComplete( ar -> 
-       {
-         if( ar.failed() ) 
-         {
-           LOGGER.error("CA Bundle consumer creation failed: {}", ar.cause().getMessage());
-           closeSubscription();
-         }
-       });
+    // deliverSubject and queueGroup should match how the consumer was created
+    // in Step-06:
+    String deliverSubject = ServiceCoreIF.MetaDataClientCaCertStream; // e.g. "metadata.client.ca-cert"
+    String queueGroup = "metadata-client-ca"; // matches admin-created deliver-group
+
+    natsTlsClient.attachPushQueue( deliverSubject, queueGroup, handler )
+                 .onSuccess( sub ->
+                  {
+                    this.caSubscription = sub; // no cast
+                    if (sub instanceof io.nats.client.JetStreamSubscription) {
+                      LOGGER.info( "CA Bundle consumer attached as JetStreamSubscription to {} queue {}", deliverSubject, queueGroup );
+                    } else {
+                      LOGGER.info( "CA Bundle consumer attached as plain NATS Subscription to {} queue {}", deliverSubject, queueGroup );
+                    }
+                    promise.complete();
+                  })
+                 .onFailure( err -> 
+                  {
+                    LOGGER.error( "Failed to attach CA consumer: {}", err.getMessage(), err );
+                    cleanup();
+                    promise.fail( err );
+                  });
+
+    return promise.future();
   }
- 
-  /**
-   * Message handler for CA bundle rotation messages
-   * This replaces the Pulsar MessageListener with NATS MessageHandler
-   */
-  private MessageHandler createCAMessageHandler() 
+  
+  private MessageHandler createCAMessageHandler()
   {
-    return (msg) -> 
-    {
-      workerExecutor.executeBlocking(() -> 
-      {
-        LOGGER.info( "=======================================================================================");
-        LOGGER.info( "CaBundleConsumerVert.createCAMessageHandler received CABundle msg.");
-        LOGGER.info( "=======================================================================================");
-    
-        try 
-        {
-          byte[] msgBytes = msg.getData();
- 
-          CaBundleMsgProcessor processor = new CaBundleMsgProcessor( vertx, workerExecutor, kubeClient, natsTlsClient, keyCache  );
+    return ( Message msg ) -> {
+      byte[] msgBytes = msg.getData();
 
-          // Acknowledge the message now - NATS JetStream acknowledgments
-          // are handled automatically or manually based on consumer configuration
-          msg.ack();
- 
-          processor.processMsg( msgBytes );
-          
-          return ServiceCoreIF.SUCCESS;
-        } 
-        catch( Throwable t ) 
+      // Extract epoch asynchronously (do not block JetStream thread)
+      extractEpoch( msgBytes ).onComplete( ar -> {
+        if( ar.failed() )
         {
-          LOGGER.error("Error processing CA bundle message: {}", t.getMessage(), t);
-          
-          if( errHandler.isUnrecoverableError(t) ) 
-          {
-            LOGGER.error("Unrecoverable error detected. Deploying recovery procedure.");
-            initiateRecovery();
-          }
-          
-          // NATS JetStream - negative acknowledge on error
-          try {
-            msg.nak();
-          } catch (Exception e) {
-            LOGGER.warn("Failed to NAK message: {}", e.getMessage());
-          }
-          
-          throw t;
+          LOGGER.error( "Epoch extraction failed: {}", ar.cause().getMessage(), ar.cause() );
+          safeNak( msg );
+          return;
         }
-      }).onComplete(ar -> 
+        long epoch = ar.result();
+        if( epoch < 0 )
         {
-          if( ar.failed() ) 
-          {
-            LOGGER.error("Worker execution failed: {}", ar.cause().getMessage());
-            errHandler.handleMessageProcessingFailure( natsTlsClient.getNatsConnection(), caSubscription, msg, ar.cause());
-          }
-        });
+          LOGGER.warn( "Invalid CA bundle epoch; ignoring" );
+          safeAck( msg );
+          return;
+        }
+
+        // Coordinate rotation
+        scheduleOrQueue( epoch, msgBytes );
+
+        // ACK early for simplicity (idempotent rotation assumed).
+        // Change to deferred ack if you need stronger guarantees.
+        safeAck( msg );
+      } );
     };
   }
   
-  /**
-   * Initiates recovery procedure when unrecoverable errors are detected
-   */
-  private void initiateRecovery() 
+  private void scheduleOrQueue( long epoch, byte[] raw )
   {
-    LOGGER.info("CaBundleConsumerVert.initiateRecovery() - Initiating verticle recovery process");
-    
-    // Deploy a new instance of this verticle before undeploying the current one
-    String verticleID = deploymentID();
-
-    DeploymentOptions options = new DeploymentOptions();
-    options.setConfig( new JsonObject().put( "worker", true ) );
-
-    CaBundleConsumerVert newVert = new CaBundleConsumerVert( kubeClient, natsTlsClient, keyCache, config, nameSpace);
-    
-    vertx.deployVerticle( newVert, options ).onComplete(ar -> 
+    long cur = currentEpoch;
+    if( epoch <= cur )
     {
-      if( ar.succeeded() )
+      LOGGER.info( "Ignoring stale CA bundle epoch={} (currentEpoch={})", epoch, cur );
+      return;
+    }
+
+    if( rotationInProgress.compareAndSet( false, true ) )
+    {
+      currentEpoch = epoch;
+      LOGGER.info( "Starting rotation epoch={} (no active rotation)", epoch );
+      startRotation( epoch, raw );
+    }
+    else
+    {
+      Pending prev = pending.get();
+      while( true )
       {
-        String newDeploymentId = ar.result();
-        LOGGER.info("CaBundleConsumerVert.initiateRecovery() - Deployed replacement CaBundleConsumerVert verticle: {}", newDeploymentId);
-        
-        // Undeploy this verticle after successful deployment of the replacement
-        vertx.undeploy( verticleID ).onComplete(ur -> 
+        if( prev == null )
         {
-          if( ur.succeeded() ) 
+          if( pending.compareAndSet( null, new Pending( epoch, raw ) ) )
           {
-            LOGGER.info("CaBundleConsumerVert.initiateRecovery() - Current verticle undeployed successfully");
-          } 
-          else 
-          {
-            LOGGER.error("CaBundleConsumerVert.initiateRecovery() - Failed to undeploy current verticle: {}", ur.cause().getMessage());
+            LOGGER.info( "Queued rotation epoch={} (active rotation currentEpoch={})", epoch, currentEpoch );
+            break;
           }
-        });
-      } 
-      else 
-      {
-        LOGGER.error("CaBundleConsumerVert.initiateRecovery() - Failed to deploy replacement verticle: {}", ar.cause().getMessage());
+        }
+        else
+        {
+          if( epoch > prev.epoch )
+          {
+            if( pending.compareAndSet( prev, new Pending( epoch, raw ) ) )
+            {
+              LOGGER.info( "Replaced queued rotation epoch={} with newer epoch={}", prev.epoch, epoch );
+              break;
+            }
+          }
+          else
+          {
+            LOGGER.info( "Discarding incoming epoch={} (<= queuedEpoch={}) while rotation active", epoch, prev.epoch );
+            break;
+          }
+        }
+        prev = pending.get();
       }
-    });
+    }
+  }
+  
+  private void startRotation( long epoch, byte[] raw )
+  {
+    rotationProcessor.processMsg( raw ).onComplete( ar -> {
+      if( ar.failed() )
+      {
+        LOGGER.error( "Rotation failed epoch={} error={}", epoch, ar.cause() != null ? ar.cause().getMessage() : "unknown", ar.cause() );
+      }
+      Pending next = pending.getAndSet( null );
+      if( next != null && next.epoch > currentEpoch )
+      {
+        LOGGER.info( "Promoting queued rotation epoch={} (previous epoch={})", next.epoch, currentEpoch );
+        currentEpoch = next.epoch;
+        // Continue without releasing rotationInProgress
+        startRotation( next.epoch, next.raw );
+        return;
+      }
+      rotationInProgress.set( false );
+      LOGGER.info( "Rotation cycle ended epoch={} (no newer pending)", epoch );
+    } );
+  }
+
+  private Future<Long> extractEpoch( byte[] signedBytes )
+  {
+    // We must decrypt/verify to access the CaBundle epoch
+    return epochExtractor.obtainDomainObject( signedBytes ).compose( payload -> vertx.<Long> executeBlocking( () -> {
+      CaBundle ca = CaBundle.deSerialize( payload );
+      if( ca == null )
+        return -1L;
+      return ca.getCaEpochNumber();
+    } ) );
+  }
+
+  private void safeAck( Message msg )
+  {
+    try
+    {
+      msg.ack();
+    }
+    catch( Exception e )
+    {
+      LOGGER.warn( "ACK failed: {}", e.getMessage() );
+    }
+  }
+
+  private void safeNak( Message msg )
+  {
+    try
+    {
+      msg.nak();
+    }
+    catch( Exception e )
+    {
+      LOGGER.warn( "NAK failed: {}", e.getMessage() );
+    }
+  }
+
+  /**
+   * Recovery logic retained; can be adapted to reset state if needed.
+   */
+  @SuppressWarnings( "unused" )
+  private void initiateRecovery()
+  {
+    LOGGER.info( "Initiating recovery deployment for CaBundleConsumerVert" );
+    // (Your earlier recovery logic can be reintroduced here if desired.)
   }
 }

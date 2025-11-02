@@ -1,0 +1,37 @@
+---
+# Certificate for TLS authentication with Pulsar
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gatekeeper-tls-credential
+  namespace: gatekeeper
+  labels:
+    app: svc-gatekeeper
+    component: tls
+spec:
+  isCA: false
+  duration: "6h"
+  renewBefore: "3h"
+  subject:
+    organizations:
+    - gatekeeper
+  commonName: gatekeeper
+  dnsNames:
+    - localhost
+    - gatekeeper
+  ipAddresses:
+    - 127.0.0.1
+    - 10.1.1.12
+  privateKey:
+    algorithm: RSA
+    size: 4096
+    rotationPolicy: Always  # This allows cert-manager to replace the key
+  usages:
+  - digital signature
+  - key encipherment
+  - client auth
+  secretName: gatekeeper-tls-credential
+  issuerRef:
+    name: gatekeeper-tls-issuer
+    kind: Issuer
+    group: cert-manager.io

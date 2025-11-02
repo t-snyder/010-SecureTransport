@@ -1,0 +1,19 @@
+{
+  "type": "record",
+  "name": "SignedMessage",
+  "namespace": "core.transport",
+  "fields": [
+    {"name": "messageId",       "type": "string" },
+    {"name": "messageType",     "type": "string" },
+    {"name": "caEpoch",         "type": "long"   },
+    {"name": "keyEpoch",        "type": "long"   },
+    {"name": "signerServiceId", "type": "string" },
+    {"name": "signerKeyId",     "type": "long"   },
+    {"name": "timestamp",       "type": "string" },
+    {"name": "signature",       "type": "bytes"  },
+    {"name": "topicName",       "type": "string" },
+    {"name": "encryptKeyId",    "type": "string" },
+    {"name": "payloadType",     "type": "string" },
+    {"name": "payload",         "type": "bytes"  }
+  ]
+}

@@ -1,10 +1,10 @@
-# PersistentVolumeClaim for secret storage
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: shared-secrets-pvc
+  namespace: metadata
   labels:
-    app: metadata-svc
+    app: metadata
     component: shared-secrets
 spec:
   accessModes:
@@ -12,38 +12,36 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  storageClassName: standard  # Adjust based on your cluster's storage classes
-
+  storageClassName: standard
 ---
-# PersistentVolumeClaim for client certs
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: client-certs-pvc
+  namespace: metadata
   labels:
-    app: metadata-svc
-#    component: shared-secrets
+    app: metadata
+    component: client-certs
 spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
       storage: 1Gi
-  storageClassName: standard  # Adjust based on your cluster's storage classes
-
+  storageClassName: standard
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: bao-agent-token-pvc
+  namespace: metadata
   labels:
-    app: metadata-svc
+    app: metadata
     component: vault-token
 spec:
   accessModes:
     - ReadWriteMany
   resources:
     requests:
-      storage: 1Gi  # More than enough for a few small files
-  storageClassName: standard  # Adjust if using a different storage class
-
+      storage: 1Gi
+  storageClassName: standard

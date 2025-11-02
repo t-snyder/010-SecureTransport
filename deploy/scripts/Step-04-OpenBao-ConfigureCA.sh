@@ -6,7 +6,7 @@
 set -e
 set -o pipefail
 
-PROTODIR=/media/tim/ExtraDrive1/Projects/009-SecureKeyAndCertRotation/deploy
+PROTODIR=/media/tim/ExtraDrive1/Projects/010-SecureTransport/deploy
 NAMESPACE="openbao"
 POD_NAME="openbao-0"
 CA_CERT_PATH="/openbao/userconfig/openbao-tls/openbao.ca"
@@ -33,7 +33,7 @@ list_issuer_ids() {
 
 # Copy a local file into the pod and kv put it from inside the pod
 kv_put_file() {
-  local secret_path="$1"     # e.g. secret/pulsar/ca-bundle
+  local secret_path="$1"     # e.g. secret/nats/ca-bundle
   local key="$2"             # e.g. ca-bundle.pem
   local local_path="$3"      # local host path
   if [ ! -f "$local_path" ]; then
@@ -148,7 +148,7 @@ echo "Ensuring nats_int mount exists..."
 bao_in_pod secrets enable -ca-cert="$CA_CERT_PATH" -path=nats_int pki || echo "nats_int already enabled"
 bao_in_pod secrets tune   -ca-cert="$CA_CERT_PATH" -max-lease-ttl=72h nats_int
 
-echo "Generating new Pulsar intermediate CSR..."
+echo "Generating new Nats intermediate CSR..."
 mkdir -p "$PROTODIR/openbao/gen/csr" "$PROTODIR/openbao/gen/crypto"
 bao_in_pod write -ca-cert="$CA_CERT_PATH" -format=json nats_int/intermediate/generate/internal \
     common_name="Nats Intermediate Authority" \
@@ -164,10 +164,10 @@ bao_in_pod write -ca-cert="$CA_CERT_PATH" -format=json pki/root/sign-intermediat
     < "$PROTODIR/openbao/gen/csr/nats_intermediate.csr" \
     | jq -r '.data.certificate' > "$PROTODIR/openbao/gen/crypto/nats_ca.crt"
 
-echo "Setting signed certificate for Pulsar intermediate CA..."
+echo "Setting signed certificate for Nats intermediate CA..."
 bao_in_pod write -ca-cert="$CA_CERT_PATH" nats_int/intermediate/set-signed certificate=- <<<"$(cat "$PROTODIR/openbao/gen/crypto/nats_ca.crt")"
 
-echo "Finding and setting Pulsar intermediate issuer ID as default..."
+echo "Finding and setting Nats intermediate issuer ID as default..."
 NATS_ISSUER_ID=""
 for id in $(list_issuer_ids nats_int); do
   ISSUER_DATA=$(bao_in_pod read -ca-cert="$CA_CERT_PATH" -format=json nats_int/issuer/$id || true)
@@ -187,7 +187,7 @@ else
     echo "Warning: Could not determine NATS_ISSUER_ID for nats_int."
 fi
 
-echo "Configuring Pulsar PKI URLs..."
+echo "Configuring Nats PKI URLs..."
 bao_in_pod write -ca-cert="$CA_CERT_PATH" nats_int/config/urls \
     issuing_certificates="$OPENBAO_ADDR/v1/nats_int/ca" \
     crl_distribution_points="$OPENBAO_ADDR/v1/nats_int/crl"
@@ -199,7 +199,7 @@ echo "=========================================="
 echo "Creating CA bundle secrets for Kubernetes"
 echo "=========================================="
 
-# Create Pulsar CA bundle (prefer assembling from local intermediate + root)
+# Create Nats CA bundle (prefer assembling from local intermediate + root)
 BUNDLE_PATH="$PROTODIR/openbao/gen/crypto/nats_ca_bundle.pem"
 echo "Creating Nats CA bundle at $BUNDLE_PATH ..."
 rm -f "$BUNDLE_PATH"
@@ -249,7 +249,7 @@ if [ "$CERT_COUNT" -lt 2 ] || [ "$BUNDLE_SIZE" -lt 100 ]; then
   exit 1
 fi
 
-# Create/update the Pulsar CA bundle secret in the openbao namespace
+# Create/update the Nats CA bundle secret in the openbao namespace
 kubectl create secret generic nats-ca-bundle \
   --from-file=ca-bundle.pem="$BUNDLE_PATH" \
   -n openbao --dry-run=client -o yaml | kubectl apply -f -
@@ -276,7 +276,7 @@ fi
 echo "Current issuer configs:"
 echo "  pki:"
 bao_in_pod read -ca-cert="$CA_CERT_PATH" pki/config/issuers || true
-echo "  pulsar_int:"
+echo "  nats_int:"
 bao_in_pod read -ca-cert="$CA_CERT_PATH" nats_int/config/issuers || true
 
 # Verify CA bundle contents
@@ -284,7 +284,7 @@ echo "CA Bundle verification:"
 if [ -f "$BUNDLE_PATH" ]; then
   CERT_COUNT=$(grep -c "BEGIN CERTIFICATE" "$BUNDLE_PATH" || echo "0")
   BUNDLE_SIZE=$(wc -c < "$BUNDLE_PATH")
-  echo "  Pulsar CA bundle contains $CERT_COUNT certificate(s), size: $BUNDLE_SIZE bytes"
+  echo "  Nats CA bundle contains $CERT_COUNT certificate(s), size: $BUNDLE_SIZE bytes"
 fi
 
 echo "=========================================="

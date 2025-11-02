@@ -1,0 +1,32 @@
+# Use an official Java runtime as a parent image
+FROM eclipse-temurin:21-jre
+
+# Set working directory in the container
+WORKDIR /app
+
+# Ensure a numeric UID/GID 1000 is present and prepare writable directories.
+# Be tolerant of an existing group/user with GID/UID 1000.
+RUN if ! getent group 1000 >/dev/null 2>&1; then \
+      groupadd -g 1000 metadata; \
+    fi && \
+    if ! getent passwd 1000 >/dev/null 2>&1; then \
+      grp=$(getent group 1000 | cut -d: -f1); \
+      useradd -u 1000 -r -g "$grp" -m -s /sbin/nologin metadata; \
+    fi && \
+    mkdir -p /app/certs /data /home/bao /app/logs && \
+    chown -R 1000:1000 /app /app/certs /data /home/bao /app/logs
+
+# Copy the JAR file into the container at /app
+COPY metadatasvc-0.1.jar /app/metadatasvc-0.1.jar
+
+# Ensure app files are owned appropriately (use numeric chown for robustness)
+RUN chown -R 1000:1000 /app
+
+# Switch to non-root user (metadata created above or present in base)
+USER 1000:1000
+
+# Configure Java options if needed (memory, etc.)
+ENV JAVA_OPTS="-Xmx512m"
+
+# Run the jar file when the container launches
+CMD ["sh", "-c", "java $JAVA_OPTS -jar /app/metadatasvc-0.1.jar"]

@@ -1,0 +1,54 @@
+global:
+  enabled: true
+  tlsDisable: false
+
+injector:
+  enabled: true
+
+server:
+  affinity: ""
+  image:
+    repository: "openbao/openbao"
+    tag: "latest"  # Use a specific tag if desired
+
+  extraEnvironmentVars:
+    OPENBAO_CACERT: /openbao/userconfig/openbao-tls/openbao.ca
+    OPENBAO_TLSCERT: /openbao/userconfig/openbao-tls/openbao.crt
+    OPENBAO_TLSKEY: /openbao/userconfig/openbao-tls/openbao.key
+
+  volumes:
+    - name: userconfig-openbao-tls
+      secret:
+        defaultMode: 420
+        secretName: openbao-tls
+
+  volumeMounts:
+    - mountPath: /openbao/userconfig/openbao-tls
+      name: userconfig-openbao-tls
+      readOnly: true
+
+  standalone:
+    enabled: false
+
+  ha:
+    enabled: true
+    replicas: 3
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = true
+        cluster_name = "openbao-integrated-storage"
+        listener "tcp" {
+          tls_disable = 0
+          address = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_cert_file = "/openbao/userconfig/openbao-tls/openbao.crt"
+          tls_key_file = "/openbao/userconfig/openbao-tls/openbao.key"
+          tls_client_ca_file = "/openbao/userconfig/openbao-tls/openbao.ca"
+        }
+        storage "raft" {
+          path = "/openbao/data"
+        }
+        disable_mlock = true
+        service_registration "kubernetes" {}

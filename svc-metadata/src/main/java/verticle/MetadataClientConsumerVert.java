@@ -84,33 +84,32 @@ public class MetadataClientConsumerVert extends AbstractVerticle
     };
   };
  
-  private Future<Void> startRequestConsumer() 
-  {
+  private Future<Void> startRequestConsumer() {
     LOGGER.info("MetadataClientConsumerVert.startRequestConsumer() - Starting metadata request consumer");
 
-    Promise<Void>    promise       = Promise.promise();
-    MessageHandler   requestMsgHandler = createMessageHandler();
-    String           subject       = ServiceCoreIF.MetaDataClientRequestStream; // Using JetStream subject naming
- 
-    // Use the consumer pool in NatsTLSClient
-    natsTlsClient.getConsumerPoolManager()
-      .getOrCreateConsumer(subject, CONSUMER_NAME, requestMsgHandler)
-      .onSuccess( c -> 
-       {
-         this.consumer = c;
-         LOGGER.info("Metadata request consumer created and subscribed to subject: {}", subject);
-         promise.complete();
-       })
-      .onFailure( e -> 
-       {
-         LOGGER.error("Consumer creation exception. Error = - " + e.getMessage());
-         cleanup();
-         promise.fail(e);
-       });
-    
+    Promise<Void> promise = Promise.promise();
+    MessageHandler requestMsgHandler = createMessageHandler();
+    String subject = ServiceCoreIF.MetaDataClientRequestStream; // e.g. "metadata.client.request"
+
+    // Bind to server-side durable created by Step-06: "metadata-request-consumer"
+    String durable = "metadata-request-consumer";
+
+    natsTlsClient.attachPushQueue(subject, durable, requestMsgHandler )
+      .onSuccess(sub -> 
+      {
+        this.consumer = (Subscription) sub;
+        LOGGER.info("Metadata request consumer attached to subject {} durable {}", subject, durable);
+        promise.complete();
+      })
+      .onFailure(err -> {
+        LOGGER.error("Failed to attach metadata request consumer: {}", err.getMessage(), err);
+        cleanup();
+        promise.fail(err);
+      });
+
     return promise.future();
   }
-
+  
   private void handleRequestMessage( Message msg )
   {
     try

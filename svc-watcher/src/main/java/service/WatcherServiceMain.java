@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -57,7 +58,7 @@ public class WatcherServiceMain
   // Default Values
   private static final String TlsCertPath   = "/app/certs/proxy/";   // Persistent volume mount path for TLS certs
   private static final String TlsCaPath     = "/app/certs/nats/";    // Persistent volume mount path for Vault NATS intermediate CA
-  private static final String DefaultNS     = "default";             // Changed from "pulsar" to "default"
+  private static final String DefaultNS     = "nats";             
   private static final String ServiceId     = "watcher";
   private static final String MetadataId    = "metadata";
   private static final String CLIENT_CERT_SECRET_NAME = "watcher-tls-credential";
@@ -108,14 +109,51 @@ public class WatcherServiceMain
 
       this.vertx = Vertx.vertx(options);
       
-      // Create a Fabric8 Kubernetes client. The client will read in-cluster configuration
-      Config apiConfig = new ConfigBuilder().build();
+      try
+      {
+        String tokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+        String token = new String( java.nio.file.Files.readAllBytes( java.nio.file.Paths.get( tokenPath ) ), java.nio.charset.StandardCharsets.UTF_8 ).trim();
 
-      LOGGER.info("WatcherServiceMain.main() - Start 2");
+        Config apiConfig = new ConfigBuilder().withOauthToken( token ) // Explicitly
+                                                                       // set
+                                                                       // the
+                                                                       // token
+            .build();
 
-      kubeClient       = new KubernetesClientBuilder().withConfig( apiConfig ).build();
-      LOGGER.info("WatcherServiceMain.main() - Kubernetes client initialized");
+        kubeClient = new KubernetesClientBuilder().withConfig( apiConfig ).build();
 
+        LOGGER.info( "WatcherServiceMain.main() - Kubernetes client initialized with explicit OAuth token" );
+
+        // Debug logging
+        LOGGER.info( "=== Kubernetes Client Config Debug ===" );
+        LOGGER.info( "Master URL: {}", apiConfig.getMasterUrl() );
+        LOGGER.info( "Namespace: {}", apiConfig.getNamespace() );
+        LOGGER.info( "OAuth Token set: {}", apiConfig.getOauthToken() != null );
+        LOGGER.info( "OAuth Token length: {}", token.length() );
+        LOGGER.info( "=== End K8s Client Config Debug ===" );
+      }
+      catch( Exception e )
+      {
+        LOGGER.error( "Failed to initialize Kubernetes client: {}", e.getMessage(), e );
+        throw new RuntimeException( "Failed to initialize Kubernetes client", e );
+      }
+     
+      // Check namespace file
+      try
+      {
+        String nsPath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+        if( java.nio.file.Files.exists( java.nio.file.Paths.get( nsPath ) ) )
+        {
+          String ns = new String( java.nio.file.Files.readAllBytes( java.nio.file.Paths.get( nsPath ) ) );
+          LOGGER.info( "ServiceAccount namespace file: {}", ns );
+        }
+      }
+      catch( Exception e )
+      {
+        LOGGER.error( "Cannot read namespace file: {}", e.getMessage() );
+      }
+
+      LOGGER.info("=== End K8s Client Config Debug ===");
       this.nameSpace   = DefaultNS;
       this.podName     = getPodName();
       this.watchConfig = readConfig( kubeClient, nameSpace, "watcher-config" );
@@ -123,16 +161,23 @@ public class WatcherServiceMain
       validateAttributes();
       this.tlsCertPath = TlsCertPath;
       this.tlsCaPath   = TlsCaPath;
-      LOGGER.info("WatcherServiceMain.main() - Cert Paths set - caPath = " + watchConfig.getNatsCaPath() + "; certPath = " + watchConfig.getNatsCertPath() );
+      LOGGER.info("WatcherServiceMain.main() - Cert Paths set - caPath = " + watchConfig.getCaCertFilePath() + "; certPath = " + watchConfig.getClientCertPath() );
 
       testNatsAccess();
-       
+ 
       Map<String, String> natsConfig = Map.of(
           NatsTLSClient.NATS_URLS,             watchConfig.getNatsURL(),
-          NatsTLSClient.NATS_CA_CERT_PATH,     tlsCaPath + "/ca.crt",
-          NatsTLSClient.NATS_CLIENT_CERT_PATH, tlsCertPath + "/tls.crt",
-          NatsTLSClient.NATS_CLIENT_SECRET,    CLIENT_CERT_SECRET_NAME
+          NatsTLSClient.NATS_CA_CERT_PATH,     watchConfig.getCaCertFilePath(),
+          NatsTLSClient.NATS_CLIENT_CERT_PATH, watchConfig.getClientCertPath(),
+          NatsTLSClient.NATS_CLIENT_SECRET,    watchConfig.getTLSSecret()
       );
+       
+//      Map<String, String> natsConfig = Map.of(
+//          NatsTLSClient.NATS_URLS,             watchConfig.getNatsURL(),
+//          NatsTLSClient.NATS_CA_CERT_PATH,     tlsCaPath + "/ca.crt",
+//          NatsTLSClient.NATS_CLIENT_CERT_PATH, tlsCertPath + "/tls.crt",
+//          NatsTLSClient.NATS_CLIENT_SECRET,    CLIENT_CERT_SECRET_NAME
+//      );
         
       natsTlsClient = new NatsTLSClient( vertx, natsConfig, kubeClient, ServiceId, nameSpace );
       LOGGER.info("WatcherServiceMain.main() - NatsTLSClient created" );
@@ -151,8 +196,7 @@ public class WatcherServiceMain
       String BundlePushConsumerTopic = ServiceCoreIF.BundlePushStreamBase  + ServiceId;
       
       // KeyExchangeVert will be deployed as a verticle later in deployPrerequisiteServices
-      keyExchangeVert = new KeyExchangeVert( natsTlsClient, keyCache, ServiceId, keyExchPublishTopic,
-                                             keyExchResponseTopic, BundlePushConsumerTopic );
+      keyExchangeVert = new KeyExchangeVert( natsTlsClient, keyCache, ServiceId );
     }
     catch( Exception e )
     {
@@ -428,13 +472,40 @@ public class WatcherServiceMain
 
         LOGGER.info("KeyExchangeVert deployed successfully: {}", deploymentIdKeyExchange);
 
+        // Wait for key exchange to signal completion, then deploy caBundleVert asynchronously (do NOT block the event-loop)
         waitForKeyExchangeComplete().onComplete( result -> 
         {
           if( !result.succeeded() ) 
           {
-            LOGGER.error("Key exchange failed: {}", result.cause().getMessage());
+            LOGGER.error("Key exchange failed: {}", result.cause() != null ? result.cause().getMessage() : "unknown");
+            cleanupResources();
+            return;
+          }
+
+          // Non-blocking deployment of CaBundleConsumerVert (do NOT call .get() on completion stages here)
+          try
+          {
+            DeploymentOptions natsOptions = new DeploymentOptions();
+            natsOptions.setConfig( new JsonObject().put( "worker", true ) );
+
+            caBundleVert = new CaBundleConsumerVert( kubeClient, natsTlsClient, keyCache, watchConfig, nameSpace );
+
+            vertx.deployVerticle( caBundleVert, natsOptions )
+              .onSuccess(deploymentIdCaBundle -> {
+                deployedVerticles.add( new ChildVerticle( caBundleVert.getClass().getName(), deploymentIdCaBundle));
+                LOGGER.info("CaBundleConsumerVert deployed successfully: {}", deploymentIdCaBundle);
+              })
+              .onFailure(deployErr -> {
+                LOGGER.error("Failed to deploy CaBundleConsumerVert: {}", deployErr.getMessage(), deployErr);
+                cleanupResources();
+              });
+          }
+          catch( Exception e )
+          {
+            LOGGER.error("Error preparing CaBundleConsumerVert deployment: {}", e.getMessage(), e);
             cleanupResources();
           }
+
         });
       } 
       catch( Exception e ) 
@@ -446,7 +517,7 @@ public class WatcherServiceMain
       return ServiceCoreIF.SUCCESS;
     });
   }
-
+  
   private Future<String> waitForKeyExchangeComplete() 
   {
     Promise<String> promise = Promise.promise();
@@ -520,11 +591,6 @@ public class WatcherServiceMain
       String deploymentIdWatcher = vertx.deployVerticle( watcherAppRoleVert, natsOptions).toCompletionStage().toCompletableFuture().get(60, TimeUnit.SECONDS);
       deployedVerticles.add( new ChildVerticle( watcherAppRoleVert.getClass().getName(), deploymentIdWatcher ));
       LOGGER.info("VaultAppRoleSecretRotationVert for watcher-vault-approle deployed successfully: {}", deploymentIdWatcher);
-
-      caBundleVert = new CaBundleConsumerVert( kubeClient, natsTlsClient, keyCache, watchConfig, nameSpace );
-      String deploymentIdCaBundle = vertx.deployVerticle( caBundleVert, natsOptions).toCompletionStage().toCompletableFuture().get(30, TimeUnit.SECONDS);
-      deployedVerticles.add( new ChildVerticle( caBundleVert.getClass().getName(), deploymentIdCaBundle));
-      LOGGER.info("CaBundleConsumerVert deployed successfully: {}", deploymentIdCaBundle);
 
     } 
     catch( Exception e )

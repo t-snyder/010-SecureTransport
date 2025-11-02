@@ -12,7 +12,7 @@ set -e
 export SERVICE_NAME=openbao-internal
 export NAMESPACE=openbao
 export SECRET_NAME=openbao-tls
-export PROTODIR=/media/tim/ExtraDrive1/Projects/009-SecureKeyAndCertRotation/deploy
+export PROTODIR=/media/tim/ExtraDrive1/Projects/010-SecureTransport/deploy
 
 # Create directories if they do not exist
 mkdir -p $PROTODIR/openbao/gen/crypto

@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gatekeeper-config
+  namespace: gatekeeper
+data:
+  # ------------------------------------------------------------------
+  # Service Identity
+  # ------------------------------------------------------------------
+  serviceId: "gatekeeper"
+
+  # ------------------------------------------------------------------
+  # NATS TLS Client Configuration  (mirrors AuthControllerConfig style)
+  # Keys chosen to align with the fields your refactored Gatekeeper
+  # Java code should read after replacing Pulsar:
+  #   natsURL, tlsSecret, caCertPath, clientCertPath
+  # ------------------------------------------------------------------
+  natsURL: "tls://10.1.1.12:4222"
+  tlsSecret: "gatekeeper-tls-credential"
+  caCertPath: "/app/certs/nats-ca-certs/ca.crt"
+  clientCertPath: "/app/certs/nats-client-certs/"
+
+  # (Optional) If you want an explicit flag like the original authcontroller map
+  # natsUseTLS: "true"
+
+  # ------------------------------------------------------------------
+  # Messaging Subjects
+  # Gatekeeper sends auth requests to AuthController and listens for
+  # responses on gatekeeperResponseTopic.
+  # Align these names with AuthControllerConfig (which uses
+  # gatewayRequestTopic / gatewayResponseTopic).
+  # ------------------------------------------------------------------
+  gatekeeperRequestTopic:  "gatekeeper.requests"        # (Optional internal use if you introduce a request intake path)
+  gatekeeperResponseTopic: "gatekeeper.responder"       # Must match AuthController's gatewayResponseTopic
+  authControllerRequestTopic: "auth.auth-request"       # Must match AuthController's gatewayRequestTopic
+
+  # ------------------------------------------------------------------
+  # OpenBao Configuration
+  # ------------------------------------------------------------------
+  baoAgentHost: "127.0.0.1"
+  gatewayAgentAddr: "http://127.0.0.1:8100"
+  gatewayAgentPort: "8100"
+  gatewayAgentTokenPath: "/home/bao/gatekeeper/token"
+
+  # ------------------------------------------------------------------
+  # AppRole Configuration
+  # ------------------------------------------------------------------
+  gatewayAppRoleName: "gatekeeper"
+  gatewayAppRoleSecretName: "gatekeeper-bao-approle"
+  secretIDRotationMs: "3600000"          # 1 hour
+
+  # ------------------------------------------------------------------
+  # Performance / Throughput Configuration
+  # ------------------------------------------------------------------
+  producerBatchSize: "1000"
+  consumerBatchSize: "1000"
+  maxConcurrentRequests: "10000"
+  requestTimeoutMs: "30000"              # 30 seconds
+  keyRotationIntervalMs: "10800000"      # 3 hours
+
+  # ------------------------------------------------------------------
+  # Auth Request Load Generator
+  # ------------------------------------------------------------------
+  ratePerSecond: "1"
+  userCount: "1"
+
+

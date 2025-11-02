@@ -1,9 +1,8 @@
 ---
-# service-account.yaml
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: metadata-svc-sa
+  name: metadata-sa
+  namespace: metadata
   labels:
-    app: metadata-svc
-
+    app: metadata
