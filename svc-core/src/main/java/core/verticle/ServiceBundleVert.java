@@ -3,9 +3,6 @@ package core.verticle;
 import io.nats.client.Message;
 import io.nats.client.MessageHandler;
 import io.nats.client.Subscription;
-
-import java.time.Duration;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -89,25 +86,9 @@ public class ServiceBundleVert extends AbstractVerticle
         workerExecutor.close();
       }
       
-      if (bundleSubscription != null)
+      if (bundleSubscription != null && bundleSubscription.isActive())
       {
-        try
-        {
-          // Try a short graceful drain, then unsubscribe
-          try 
-          { 
-            bundleSubscription.drain( Duration.ofSeconds(2)); 
-          } 
-          catch( Exception ignore ) {}
-        } 
-        catch( Throwable ignored ) {}
-
-        try
-        { 
-          bundleSubscription.unsubscribe(); 
-        } 
-        catch( Exception ignored ) {}
-        bundleSubscription = null;
+        bundleSubscription.unsubscribe();
       }
       
       LOGGER.info("NatsServiceBundleVert cleaned up for service: {}", serviceId);
@@ -156,26 +137,26 @@ public class ServiceBundleVert extends AbstractVerticle
     };
   }
 
-  private void startServiceBundleConsumer()
-      throws Exception
-    {
-      LOGGER.info("NatsServiceBundleVert.startServiceBundleConsumer() - Starting service bundle push consumer");
+  private void startServiceBundleConsumer() 
+    throws Exception
+  {
+    LOGGER.info("NatsServiceBundleVert.startServiceBundleConsumer() - Starting service bundle push consumer");
 
-      String subject = ServiceCoreIF.BundlePushStreamBase + consumerSubjectId;
-      String queueGroup = serviceId + "-bundle-push-consumer"; // match admin-created deliver-group
-
-      natsTlsClient.attachPushQueue(subject, queueGroup, serviceBundleMsgHandler())
-        .onSuccess( subscription ->
-        {
-          this.bundleSubscription = subscription;
-          LOGGER.info("NatsServiceBundleVert: Subscribed to Service Bundle Push subject: {}", subject);
-        })
-        .onFailure(ex ->
-        {
-          LOGGER.error("Failed to subscribe to Service Bundle subject", ex);
-          throw new RuntimeException(ex);
-        });
-    }
+    String subject = ServiceCoreIF.BundlePushStreamBase + consumerSubjectId;
+    String consumerName = serviceId + "-bundle-push-consumer";
+ 
+    natsTlsClient.getConsumerPoolManager()
+      .getOrCreateConsumer(subject, consumerName, serviceBundleMsgHandler())
+     .onSuccess(subscription -> 
+      {
+        this.bundleSubscription = subscription;
+        LOGGER.info("NatsServiceBundleVert: Subscribed to Service Bundle Push subject: {}", subject);
+      })
+     .onFailure(ex -> 
+      {
+        LOGGER.error("Failed to subscribe to Service Bundle subject", ex);
+      });
+  }
 
   /**
    * The steps for receiving, decrypting and validating the message are essentially the reverse of creation:

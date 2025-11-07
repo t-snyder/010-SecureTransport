@@ -2,14 +2,12 @@ package core.processor;
 
 import core.crypto.AesGcmHkdfCrypto;
 import core.crypto.EncryptedData;
-import core.exceptions.KeyMissingException;
 import core.handler.KeySecretManager;
 import core.model.DilithiumKey;
 import core.model.service.TopicKey;
 import core.service.DilithiumService;
 import core.transport.SignedMessage;
 import core.utils.KeyEpochUtil;
-import core.utils.CAEpochUtil;
 
 import io.vertx.core.Future;
 import io.vertx.core.WorkerExecutor;
@@ -19,8 +17,6 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 
 /**
@@ -40,11 +36,8 @@ public class SignedMessageProcessor
   private final KeySecretManager keyCache;
   private final AesGcmHkdfCrypto aesCrypto;
   private final DilithiumService signingManager;
-//  private final KeyEpochUtil     keyEpochUtil = new KeyEpochUtil();
-  private final CAEpochUtil      caEpochUtil  = new CAEpochUtil();
+  private final KeyEpochUtil     epochUtil = new KeyEpochUtil();
 
-  private final ConcurrentHashMap<String, Future<Void>> pendingKeyFetches = new ConcurrentHashMap<>();
- 
   public SignedMessageProcessor( WorkerExecutor workerExecutor, KeySecretManager keyCache )
   {
     this.workerExecutor = workerExecutor;
@@ -60,7 +53,7 @@ public class SignedMessageProcessor
                                                     String payloadType, // type code for payload - generally the same as messageType
                                                     String topic    )      // topic name the message will be sent on.
   {
-    LOGGER.debug("Generating SignedMessage for service: {}", serviceId);
+    LOGGER.info("Generating SignedMessage for service: {}", serviceId);
 
     // Get signing key (blocking)
     return workerExecutor.<DilithiumKey>executeBlocking( () -> 
@@ -112,7 +105,7 @@ public class SignedMessageProcessor
                                                    String topic,
                                                    byte[] sharedSecret)
   {
-    LOGGER.debug("Generating SignedMessage for service: {} using shared secret encryption", serviceId);
+    LOGGER.info("Generating SignedMessage for service: {} using shared secret encryption", serviceId);
 
     // Get signing key (blocking)
     return workerExecutor.<DilithiumKey>executeBlocking( () -> 
@@ -157,8 +150,8 @@ public class SignedMessageProcessor
                                                               byte[] signature)
    throws Exception
   {
-    long           keyEpoch = KeyEpochUtil.epochNumberForInstant(Instant.now());
-    List<TopicKey> keyList  = keyCache.getValidTopicKeysSorted( topic );
+    long keyEpoch = KeyEpochUtil.epochNumberForInstant(Instant.now());
+    List<TopicKey> keyList = keyCache.getValidTopicKeysSorted( topic );
 
     TopicKey topicKey = null;
     for( TopicKey key : keyList ) 
@@ -172,23 +165,6 @@ public class SignedMessageProcessor
 
     if (topicKey == null) 
     {
-      LOGGER.error( "============================================================" );
-      LOGGER.error( " Could not find topic Key for topic = " + topic + "; for epoch = " + keyEpoch );
-      LOGGER.error( "Topic keys found for this topic are:"  );
-      for( TopicKey key : keyList )
-      {
-        LOGGER.error( "Epoch = " + key.getEpochNumber() + " keyId " + key.getKeyId() );
-      }
-
-      Set<String> topics = keyCache.getAllTopicsWithKeys();
-      LOGGER.error( "    ");
-      LOGGER.error( "Topics supported by this service are:" );
-      for( String nm : topics )
-      {
-        LOGGER.error( nm );
-      }
-      LOGGER.error( "============================================================" );
-      
       String errMsg = "Could not obtain an encryption key for topic: " + topic;
       LOGGER.error(errMsg);
       throw new RuntimeException(errMsg);
@@ -200,17 +176,13 @@ public class SignedMessageProcessor
       throw new RuntimeException("Failed to encrypt for server: " + serviceId);
     }
     
-    LOGGER.debug("Successfully generated and encrypted bundle for server: {} using topic key", serviceId);
+    LOGGER.info("Successfully generated and encrypted bundle for server: {} using topic key", serviceId);
 
-    Instant now     = Instant.now();
-    long    caEpoch = caEpochUtil.epochNumberForInstant( now );
-    return new SignedMessage( serviceId + now.toString(),
+    return new SignedMessage( serviceId + Instant.now().toString(),
                               messageType,
-                              caEpoch,
-                              keyEpoch,
                               serviceId,
                               signingKey.getEpochNumber(),
-                              now,
+                              Instant.now(),
                               signature,
                               topic,
                               topicKey.getKeyId(),
@@ -244,19 +216,13 @@ public class SignedMessageProcessor
       throw new RuntimeException("Failed to encrypt with shared secret for server: " + serviceId);
     }
     
-    LOGGER.debug("Successfully generated and encrypted bundle for server: {} using shared secret", serviceId);
+    LOGGER.info("Successfully generated and encrypted bundle for server: {} using shared secret", serviceId);
 
     // For shared secret encryption, we use a special key ID to indicate this is not a topic key
     String sharedSecretKeyId = SHARED_SECRET_KEY_ID_PREFIX + System.currentTimeMillis();
 
-    Instant now      = Instant.now();
-    long    keyEpoch = KeyEpochUtil.epochNumberForInstant( now );
-    long    caEpoch  = caEpochUtil.epochNumberForInstant(  now );
-
     return new SignedMessage(serviceId + Instant.now().toString(),
                              messageType,
-                             caEpoch,
-                             keyEpoch,
                              serviceId,
                              signingKey.getEpochNumber(),
                              Instant.now(),
@@ -277,11 +243,10 @@ public class SignedMessageProcessor
     {
       try
       {
-        SignedMessage signedMsg = SignedMessage.deSerialize( signedMsgBytes );
+        SignedMessage signedMsg = SignedMessage.deserialize( signedMsgBytes );
         EncryptedData encData   = EncryptedData.deserialize( signedMsg.getPayload() );
 
         TopicKey encKey = keyCache.getTopicKey( signedMsg.getTopicName(), signedMsg.getEncryptKeyId() );
-/**
         if( encKey == null )
         {
           String errMsg = "Encryption key could not be found for decryption. ServiceId = " + signedMsg.getSignerServiceId() + 
@@ -290,34 +255,6 @@ public class SignedMessageProcessor
           LOGGER.error( errMsg );
           throw new Exception( errMsg );
         }
-*/
-        if( encKey == null ) 
-        {
-          LOGGER.error( "============================================================" );
-          LOGGER.error( " Could not find topic Key for topic = " + signedMsg.getTopicName() + "; for keyId = " + signedMsg.getEncryptKeyId() );
-          LOGGER.error( "Topic keys found for this topic are:"  );
-
-          List<TopicKey> keyList = keyCache.getValidTopicKeysSorted( signedMsg.getTopicName() );
-          for( TopicKey key : keyList )
-          {
-            LOGGER.error( "Epoch = " + key.getEpochNumber() + " keyId " + key.getKeyId() );
-          }
-
-          Set<String> topics = keyCache.getAllTopicsWithKeys();
-          LOGGER.error( "    ");
-          LOGGER.error( "Topics supported by this service are:" );
-          for( String nm : topics )
-          {
-            LOGGER.error( nm );
-          }
-          LOGGER.error( "============================================================" );
-          
-          String errMsg = "Could not obtain an encryption key for topic: " + signedMsg.getTopicName();
-          LOGGER.error(errMsg);
-//          throw new RuntimeException(errMsg);
-          throw new KeyMissingException( signedMsg.getSignerServiceId(), signedMsg.getTopicName(), signedMsg.getEncryptKeyId(),
-              "Encryption key could not be found for decryption. Topic = " + signedMsg.getTopicName() + "; keyid = " + signedMsg.getEncryptKeyId());
-       }
 
         byte[] domainBytes = aesCrypto.decrypt( encData, encKey.getKeyData() );
 
@@ -329,21 +266,6 @@ public class SignedMessageProcessor
         throw new RuntimeException( e );
       }
     })
-    .recover( err -> 
-     {
-       if( err instanceof KeyMissingException ) 
-       {
-         KeyMissingException kme = (KeyMissingException) err;
-              
-         LOGGER.info( "Key missing for topic '{}', keyId '{}' - attempting on-demand fetch", 
-                      kme.getTopic(), kme.getKeyId());
-              
-         return fetchMissingKeyAndRetry(signedMsgBytes, kme);
-       }
-          
-      // Other error - propagate
-       return Future.failedFuture(err);
-     })
     .compose( tuple -> 
      {
        byte[]        domainBytes  = tuple._1;
@@ -390,7 +312,7 @@ public class SignedMessageProcessor
     {
       try
       {
-        SignedMessage signedMsg = SignedMessage.deSerialize(signedMsgBytes);
+        SignedMessage signedMsg = SignedMessage.deserialize(signedMsgBytes);
         EncryptedData encData   = EncryptedData.deserialize(signedMsg.getPayload());
 
         if( encKey == null )
@@ -410,114 +332,7 @@ public class SignedMessageProcessor
         throw new RuntimeException(e);
       }
     });
-  } 
-  
-  private Future<Tuple3<byte[], SignedMessage, Long>> fetchMissingKeyAndRetry( byte[] signedMsgBytes, KeyMissingException kme )
-  {
-
-    // Extract epoch from keyId (e.g., "gatekeeper.responder-epoch-1957385")
-    long missingEpoch = extractEpochFromKeyId( kme.getKeyId() );
-    if( missingEpoch < 0 )
-    {
-      LOGGER.error( "Could not extract epoch from keyId: {}", kme.getKeyId() );
-      return Future.failedFuture( kme );
-    }
-
-    // Determine which service's ServiceBundle we need
-    // For topic keys, we need the ServiceBundle for the service that produces
-    // to this topic
-    // This is typically the signerServiceId from the message
-    String targetServiceId = kme.getServiceId();
-
-    LOGGER.info( "Attempting to fetch ServiceBundle: service='{}', epoch={}", targetServiceId, missingEpoch );
-
-    // Check if already fetching this key to avoid duplicate requests
-    String fetchKey = targetServiceId + ":" + missingEpoch;
-
-    // Get or create fetch future
-    Future<Void> fetchFuture = pendingKeyFetches.computeIfAbsent( fetchKey, k -> 
-    {
-      LOGGER.info( "Initiating ServiceBundle fetch for key '{}'", k );
-      return keyCache.loadServiceBundleForEpoch( targetServiceId, missingEpoch ).onComplete( ar -> {
-        // Remove from pending map when complete
-        pendingKeyFetches.remove( k );
-
-        if( ar.succeeded() )
-        {
-          LOGGER.info( "✅ ServiceBundle fetch successful for key '{}'", k );
-        }
-        else
-        {
-          LOGGER.error( "❌ ServiceBundle fetch failed for key '{}': {}", k, ar.cause().getMessage() );
-        }
-      } );
-    } );
-
-    // Wait for fetch to complete, then retry decryption
-    return fetchFuture.compose( v -> {
-      LOGGER.info( "Retrying decryption after ServiceBundle fetch" );
-
-      // Retry the decryption with newly loaded keys
-      return workerExecutor.<Tuple3<byte[], SignedMessage, Long>> executeBlocking( () -> {
-        try
-        {
-          SignedMessage signedMsg = SignedMessage.deSerialize( signedMsgBytes );
-          EncryptedData encData = EncryptedData.deserialize( signedMsg.getPayload() );
-
-          // Try to get encryption key again
-          TopicKey encKey = keyCache.getTopicKey( signedMsg.getTopicName(), signedMsg.getEncryptKeyId() );
-
-          if( encKey == null )
-          {
-            // Still not found after fetch - log detailed error
-            LOGGER.error( "============================================================" );
-            LOGGER.error( "Key STILL not found after ServiceBundle fetch!" );
-            LOGGER.error( "Service: {}, Topic: {}, KeyId: {}, Epoch: {}", targetServiceId, kme.getTopic(), kme.getKeyId(), missingEpoch );
-            LOGGER.error( "============================================================" );
-
-            throw new KeyMissingException( targetServiceId, kme.getTopic(), kme.getKeyId(), "Key not found even after ServiceBundle fetch - may not exist in Vault" );
-          }
-
-          // Decrypt with newly loaded key
-          byte[] domainBytes = aesCrypto.decrypt( encData, encKey.getKeyData() );
-
-          LOGGER.info( "✅ Decryption successful after on-demand key fetch" );
-
-          return new Tuple3<>( domainBytes, signedMsg, signedMsg.getSignerKeyId() );
-
-        }
-        catch( Exception e )
-        {
-          LOGGER.error( "Retry decryption failed: {}", e.getMessage(), e );
-          throw new RuntimeException( e );
-        }
-      } );
-    } );
-  }
-
-  /**
-   * Extract epoch number from keyId string
-   */
-  private long extractEpochFromKeyId( String keyId )
-  {
-    if( keyId == null || !keyId.contains( "-epoch-" ) )
-    {
-      return -1;
-    }
-
-    try
-    {
-      int lastDash = keyId.lastIndexOf( '-' );
-      String epochStr = keyId.substring( lastDash + 1 );
-      return Long.parseLong( epochStr );
-    }
-    catch( Exception e )
-    {
-      LOGGER.debug( "Could not extract epoch from keyId '{}': {}", keyId, e.getMessage() );
-      return -1;
-    }
-  }
-  
+  }  
   /**
    * Public wrapper to verify a domain's signature using a provided DilithiumKey.
    * Returns the underlying signingManager.verify Future so callers can compose on it.
@@ -530,6 +345,7 @@ public class SignedMessageProcessor
 
   /**
    * Common signature verification logic used by both obtainDomainObject methods.
+   */
   private Future<byte[]> verifySignatureAndReturnDomain(Tuple3<byte[], SignedMessage, Long> tuple)
   {
     byte[]        domainBytes = tuple._1;
@@ -559,7 +375,6 @@ public class SignedMessageProcessor
           }
         });
   }
-   */
 
   /**
    * Tuple3 utility for intermediate results.

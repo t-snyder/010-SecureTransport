@@ -48,8 +48,6 @@ public class CertificateManager
   private final CertificateUpdateCallbackIF updateCallback; // Interface instead of concrete class
   private CompletableFuture<Void>           certReadyFuture = new CompletableFuture<>();
 
-  private volatile boolean initialLoadComplete = false;
-
   private Watch certWatcher;
 
   
@@ -93,7 +91,6 @@ public class CertificateManager
 
       // Load initial certificates
       loadCertificate();
-      initialLoadComplete = true;
 
       // Start watching for certificate updates
       watchCertificateSecret();
@@ -232,7 +229,7 @@ public class CertificateManager
       {
         LOGGER.info( "Certificate secret {} event: {}", clientCertSecretName, action );
 
-        if( action == Action.MODIFIED || ( action == Action.ADDED  && initialLoadComplete ))
+        if( action == Action.MODIFIED || action == Action.ADDED )
         {
           try
           {
@@ -257,12 +254,6 @@ public class CertificateManager
             }
           }
         }
-        else if( action == Action.ADDED )
-        {
-          LOGGER.debug("Ignoring initial ADDED event...");
-        }
-        
-        initialLoadComplete = true;  // ← Set after first event (ADDED or MODIFIED)
       }
 
       @Override

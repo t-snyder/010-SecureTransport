@@ -1,1631 +1,820 @@
 package core.nats;
 
-import io.nats.client.*;
-import io.nats.client.api.StreamInfo;
-import io.nats.client.PushSubscribeOptions;
-
+import core.handler.CertificateUpdateCallbackIF;
+import core.nats.NatsTLSClient.GracefulMigrationCapable;
+import core.utils.CaRotationWindowManager;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.WorkerExecutor;
+
+import io.nats.client.*;
+import io.nats.client.JetStream;
+import io.nats.client.JetStreamSubscription;
+import io.nats.client.MessageHandler;
+import io.nats.client.PushSubscribeOptions;
+
+import io.nats.client.api.ConsumerConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import core.handler.CertificateUpdateCallbackIF;
-
 import java.time.Duration;
-import java.util.*;
+import java.time.Instant;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-//import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * NATS Consumer Pool Manager (non-blocking migration)
+ * Enhanced Consumer Pool Manager for NATS JetStream with Graceful Migration Support
  *
- * - Non-blocking migration on certificate updates.
- * - Per-consumer retries/backoff when reattaching.
- * - Avoids blocking the Vert.x event loop.
- * - Tracks descriptor.createdByManager to avoid deleting admin-created durables.
+ * Now automatically registers any consumer requested/created so the pool can
+ * proactively warm-up (recreate) them during graceful CA rotation. No external
+ * registration is required by services.
  */
-public class NatsConsumerPoolManager implements CertificateUpdateCallbackIF
+public class NatsConsumerPoolManager implements CertificateUpdateCallbackIF, GracefulMigrationCapable
 {
   private static final Logger LOGGER = LoggerFactory.getLogger(NatsConsumerPoolManager.class);
 
-  private final Vertx vertx;
-  private final WorkerExecutor workerExecutor;
-  private final NatsTLSClient natsTlsClient;
+  // Pool configuration
+  private static final Duration CONSUMER_TTL              = Duration.ofMinutes(60);
+  private static final Duration CLEANUP_INTERVAL          = Duration.ofMinutes(5);
+  private static final Duration IDLE_CONNECTION_THRESHOLD = Duration.ofSeconds(30);
+  private static final Duration DRAINAGE_CHECK_INTERVAL   = Duration.ofSeconds(5);
 
-  // Generation tracking
+  // Core dependencies
+  private final Vertx           vertx;
+  private final NatsTLSClient   natsTlsClient;
+  private final WorkerExecutor  workerExecutor;
+
+  // Pool management: active pooled consumers
+  private final ConcurrentHashMap<String, PooledConsumer> pool = new ConcurrentHashMap<>();
+
+  // Registry of all consumers requested/created (automatically populated)
+  private final ConcurrentHashMap<String, ConsumerDescriptor> registeredConsumers = new ConcurrentHashMap<>();
+
+  // Certificate generation tracking
+  private volatile long    currentCertificateGeneration = 1;
   private final AtomicLong generationCounter = new AtomicLong(1);
-  private volatile long currentCertificateGeneration = 1;
 
-  // Track consumers being drained (old generation)
-  private final ConcurrentHashMap<String, ConsumerContext> drainingConsumers = new ConcurrentHashMap<>();
+  // Graceful migration support
+  private volatile boolean    migrationInProgress = false;
+  private volatile long       migrationGeneration = 0;
+  private volatile Connection newConnection       = null;
+  private volatile long       drainageTimerId     = -1;
 
-  private final AtomicInteger activeDrainOperations = new AtomicInteger(0);
-  private static final int    MAX_CONCURRENT_DRAINS = 10;
+  // Metrics and monitoring
+  private final AtomicLong    totalConsumersCreated  = new AtomicLong(0);
+  private final AtomicLong    totalConsumersClosed   = new AtomicLong(0);
+  private final AtomicInteger currentActiveConsumers = new AtomicInteger(0);
+  private final AtomicLong    totalPoolHits          = new AtomicLong(0);
+  private final AtomicLong    totalPoolMisses        = new AtomicLong(0);
 
-  // Consumer tracking
-  private final ConcurrentHashMap<String, ConsumerContext>    consumerPool = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<String, ConsumerDescriptor> consumerRegistry = new ConcurrentHashMap<>();
-
-  
-  /**
-   * Consumer context with generation, connection and dispatcher tracking
-  private static class ConsumerContext
-  {
-    final JetStreamSubscription subscription;
-    final Dispatcher dispatcher;
-    final Connection connection;
-    final long generation;
-
-    ConsumerContext(JetStreamSubscription subscription, Dispatcher dispatcher, Connection connection, long generation)
-    {
-      this.subscription = subscription;
-      this.dispatcher = dispatcher;
-      this.connection = connection;
-      this.generation = generation;
-    }
-  }
-   */
-
-  /**
-   * Consumer context with generation, connection and dispatcher tracking
-   * Supports either a JetStreamSubscription (server/client-managed consumer)
-   * or a plain NATS Subscription (deliver subject from an admin-created server consumer).
-   */
-  private static class ConsumerContext
-  {
-    final JetStreamSubscription jsSubscription; // null when using plain NATS deliver-sub subscription
-    final Subscription plainSubscription;  // null when using JetStream subscription attach
-    final Dispatcher dispatcher;
-    final Connection connection;
-    final long generation;
-
-    ConsumerContext(JetStreamSubscription jsSubscription, Subscription plainSubscription, Dispatcher dispatcher, Connection connection, long generation)
-    {
-      this.jsSubscription = jsSubscription;
-      this.plainSubscription = plainSubscription;
-      this.dispatcher = dispatcher;
-      this.connection = connection;
-      this.generation = generation;
-    }
-
-    public JetStreamSubscription getJsSubscription() { return jsSubscription; }
-    public Subscription getPlainSubscription() { return plainSubscription; }
-
-    /**
-     * Returns whichever subscription is active/preferred (JetStream if present).
-     */
-    public Subscription getEffectiveSubscription()
-    {
-      return jsSubscription != null ? jsSubscription : plainSubscription;
-    }
-
-    /**
-     * Safe check for "isActive" across both types.
-     */
-    public boolean isSubscriptionActive()
-    {
-      Subscription s = getEffectiveSubscription();
-      if (s == null) return false;
-      try {
-        return s.isActive();
-      } catch (Throwable t) {
-        // If the client impl doesn't support .isActive() for the type, assume true to avoid premature recreation.
-        return true;
-      }
-    }
-  }
-  
-  public static enum ConsumerType { PUSH_QUEUE, PULL_DURABLE }
-
-  /**
-   * Consumer descriptor for recreation
-   *
-   * createdByManager: true => manager-created server-side durable (safe to delete)
-   *                  false => admin-created durable (do not delete server-side)
-   */
-  public static class ConsumerDescriptor
-  {
-    private final String         subject;
-    private final String         consumerNameOrQueue; // durable name or queue group
-    private final MessageHandler handler;
-    private final ConsumerType   type;
-    private final boolean        createdByManager;
-
-    public ConsumerDescriptor(String subject, String consumerNameOrQueue, MessageHandler handler, ConsumerType type, boolean createdByManager) {
-      this.subject             = subject;
-      this.consumerNameOrQueue = consumerNameOrQueue;
-      this.handler             = handler;
-      this.type                = type;
-      this.createdByManager    = createdByManager;
-    }
-
-    public String         getSubject()             { return subject;             }
-    public String         getConsumerNameOrQueue() { return consumerNameOrQueue; }
-    public MessageHandler getHandler()             { return handler;             }
-    public ConsumerType   getType()                { return type;                }
-    public boolean        isCreatedByManager()     { return createdByManager;    }
-  }
+  // Lifecycle management
+  private volatile boolean isShutdown     = false;
+  private long             cleanupTimerId = -1;
 
   public NatsConsumerPoolManager(Vertx vertx, NatsTLSClient natsTlsClient)
   {
-    this.vertx = vertx;
-    // create a small worker executor for blocking flush/drain work (adjust size if needed)
-    this.workerExecutor = vertx.createSharedWorkerExecutor("nats-consumer-cleanup", 2);
+    this.vertx         = vertx;
     this.natsTlsClient = natsTlsClient;
+    this.workerExecutor = vertx.createSharedWorkerExecutor("nats-consumer-pool-manager", 4, 360000);
+
+    LOGGER.info("NatsConsumerPoolManager initialized - TTL: {}min", CONSUMER_TTL.toMinutes());
   }
 
   /**
-   * Attach to an existing server-side push/queue consumer by subscribing to the
-   * deliver subject with the queue group. This assumes the admin created a push
-   * consumer with deliverSubject and deliverGroup (queue).
-   *
-   * NOTE: register descriptor with createdByManager = false (admin-owned).
-   *
-   * Behavior change:
-   * - If the descriptor is admin-created (createdByManager == false), subscribe
-   *   directly to the deliver subject (plain NATS subscription with queue group).
-   *   This consumes the server-managed push consumer delivery target and avoids
-   *   creating a new JetStream consumer on the server (which caused replays).
-   * - Otherwise fall back to client-managed JetStream subscribe (same as before).
+   * Start the consumer pool manager
    */
-  public Future<Subscription> attachPushQueue( String deliverSubject, String queueGroup, MessageHandler handler )
+  public void start()
   {
-    return vertx.executeBlocking( () -> 
+    if (isShutdown)
     {
-      String key = deliverSubject + ":queue:" + queueGroup;
-      long currentGen = currentCertificateGeneration;
-
-      // Register descriptor as admin-owned by default (upstream logic may
-      // override)
-      consumerRegistry.putIfAbsent( key, new ConsumerDescriptor( deliverSubject, queueGroup, handler, ConsumerType.PUSH_QUEUE, false ) );
-
-      ConsumerContext ctx = consumerPool.get( key );
-      if( ctx != null && ctx.generation == currentGen )
-      {
-        try
-        {
-          if( ctx.isSubscriptionActive() )
-          {
-            Connection conn = ctx.connection;
-            if( conn != null && conn.getStatus() == Connection.Status.CONNECTED )
-            {
-              LOGGER.debug( "Reusing push-queue subscription: {} (generation {})", key, currentGen );
-              return (Subscription)ctx.getEffectiveSubscription();
-            }
-          }
-        }
-        catch( Exception e )
-        {
-          LOGGER.info( "Validation failed for existing push-queue subscription {}, recreating: {}", key, e.getMessage(), e );
-        }
-      }
-
-      if( ctx != null )
-      {
-        cleanupConsumerContext( key, ctx );
-        consumerPool.remove( key );
-      }
-
-      Connection conn = natsTlsClient.getConnectionForNewOperations();
-      if( conn == null || conn.getStatus() != Connection.Status.CONNECTED )
-      {
-        throw new IllegalStateException( "No NATS connection available for push queue subscribe" );
-      }
-
-      Dispatcher dispatcher = conn.createDispatcher();
-      LOGGER.info( "Subscribing to push-queue: subject={} queue={} (gen={})", deliverSubject, queueGroup, currentGen );
-
-      // Inspect registry entry to see if this consumer was admin-created.
-      ConsumerDescriptor desc = consumerRegistry.get( key );
-
-      // If descriptor exists and is admin-created, subscribe to the deliver
-      // subject directly (plain NATS subscription).
-      if( desc != null && !desc.isCreatedByManager() )
-      {
-        LOGGER.info( "Detected admin-created consumer for key {} - subscribing to deliver subject directly", key );
-        // Subscribe to the deliver subject with queue semantics (server will
-        // deliver to this deliver subject)
-        Subscription plainSub;
-        try
-        {
-          if( queueGroup == null || queueGroup.isBlank() )
-          {
-            // subscribe without queue group (each client receives its own
-            // deliveries to this deliver subject)
-            plainSub = dispatcher.subscribe( deliverSubject, desc.getHandler() );
-          }
-          else
-          {
-            // subscribe with queue group (legacy behavior, load-balanced)
-            plainSub = dispatcher.subscribe( deliverSubject, queueGroup, desc.getHandler() );
-          }
-        }
-        catch( Exception e )
-        {
-          LOGGER.warn( "Failed to subscribe to deliver subject {} as plain subscription: {}. Falling back to JetStream subscribe", deliverSubject, e.getMessage() );
-          plainSub = null;
-        }
-        if( plainSub != null )
-        {
-          ConsumerContext newCtx = new ConsumerContext( null, plainSub, dispatcher, conn, currentGen );
-          consumerPool.put( key, newCtx );
-          LOGGER.info( "Attached plain deliver-subscription: {} (generation {})", key, currentGen );
-          return (Subscription)plainSub;
-        }
-        // else fallthrough to JetStream binding
-      }
-
-      // Fallback / client-managed JetStream subscription
-      // If the server consumer exists and a durable name is known (e.g.,
-      // consumerRegistry stored it),
-      // you could set .durable(durableName) here to bind. For now, mirror
-      // previous behavior but prefer
-      // to bind to durable when descriptor indicates manager-created consumer
-      // (if available).
-      PushSubscribeOptions pushOpts = PushSubscribeOptions.builder().deliverGroup( queueGroup ).build();
-
-      JetStreamSubscription jss = conn.jetStream().subscribe( deliverSubject, dispatcher, handler, false, pushOpts );
-
-      ConsumerContext newCtx = new ConsumerContext( jss, null, dispatcher, conn, currentGen );
-      consumerPool.put( key, newCtx );
-
-      LOGGER.info( "Attached push-queue subscription: {} (generation {})", key, currentGen );
-      return (Subscription)jss;
-    } );
-  }
-
-  /**
-   * Attach/bind to an existing server-side pull durable consumer by durable name.
-   * This binds the client subscription to the server durable (no admin create attempted).
-   *
-   * NOTE: register descriptor with createdByManager = false (admin-owned).
-   *
-   * NOTE: This code path uses push-style handler attach as a fallback for
-   * environments that only use push deliveries. If you need true pull-mode,
-   * implement a dedicated pull-mode attach + fetch loop.
-   *
-   * Behavior change:
-   * - If runtime cannot create a true pull subscription and must fall back to a push
-   *   subscriber, attempt to bind to the existing durable by specifying durable(durableName).
-   *   That avoids creation of a new ephemeral consumer on the server.
-   */
-  public Future<Subscription> attachPullConsumer(String subject, String durableName, MessageHandler handler) {
-    return vertx.executeBlocking(() -> {
-      String key = subject + ":" + durableName;
-      long currentGen = currentCertificateGeneration;
-
-      // Register descriptor as admin-owned (we did NOT create the server durable)
-      consumerRegistry.putIfAbsent(key, new ConsumerDescriptor(subject, durableName, handler, ConsumerType.PULL_DURABLE, false));
-
-      ConsumerContext ctx = consumerPool.get(key);
-      if (ctx != null && ctx.generation == currentGen) {
-        try {
-          if (ctx.isSubscriptionActive()) {
-            Connection conn = ctx.connection;
-            if (conn != null && conn.getStatus() == Connection.Status.CONNECTED) {
-              LOGGER.debug("Reusing pull-bound subscription: {} (generation {})", key, currentGen);
-              return (Subscription) ctx.getEffectiveSubscription();
-            }
-          }
-        } catch (Exception e) {
-          LOGGER.info("Validation failed for existing pull-bound subscription {}, recreating: {}", key, e.getMessage());
-        }
-      }
-
-      if (ctx != null) {
-        cleanupConsumerContext(key, ctx);
-        consumerPool.remove(key);
-      }
-
-      Connection conn = natsTlsClient.getConnectionForNewOperations();
-      if (conn == null || conn.getStatus() != Connection.Status.CONNECTED) {
-        throw new IllegalStateException("No NATS connection available for pull bind");
-      }
-
-      LOGGER.info("Binding to pull-durable fallback (push subscribe) subject={} durable={} (gen={})", subject, durableName, currentGen);
-
-      Dispatcher dispatcher = conn.createDispatcher();
-
-      // Attempt to bind to existing durable on server by specifying durable name in PushSubscribeOptions.
-      // This avoids creating a new ephemeral consumer object on the server.
-      JetStreamSubscription jss;
-      try {
-        PushSubscribeOptions bindOpts = PushSubscribeOptions.builder()
-          .durable(durableName)
-          .build();
-
-        jss = conn.jetStream().subscribe(subject, dispatcher, handler, false, bindOpts);
-      } catch (Exception e) {
-        LOGGER.warn("Binding to durable {} failed (falling back to non-durable push subscribe): {}", durableName, e.getMessage());
-        jss = conn.jetStream().subscribe(subject, dispatcher, handler, false);
-      }
-
-      ConsumerContext newCtx = new ConsumerContext(jss, null, dispatcher, conn, currentGen);
-      consumerPool.put(key, newCtx);
-
-      LOGGER.info("Attached (push-fallback) subscription for key={} (generation {})", key, currentGen);
-      return (Subscription) jss;
-    });
-  }  
-  
-  
-  /**
-   * Attach to an existing server-side push/queue consumer by subscribing to the
-   * deliver subject with the queue group. This assumes the admin created a push
-   * consumer with deliverSubject and deliverGroup (queue).
-   *
-   * NOTE: register descriptor with createdByManager = false (admin-owned).
-  public Future<Subscription> attachPushQueue( String deliverSubject, String queueGroup, MessageHandler handler )
-  {
-    return vertx.executeBlocking(() ->
-    {
-      String key = deliverSubject + ":queue:" + queueGroup;
-      long currentGen = currentCertificateGeneration;
-
-      // Register descriptor as admin-owned
-      consumerRegistry.putIfAbsent(key,
-        new ConsumerDescriptor(deliverSubject, queueGroup, handler, ConsumerType.PUSH_QUEUE, false));
-
-      ConsumerContext ctx = consumerPool.get(key);
-      if (ctx != null && ctx.generation == currentGen) {
-        if (ctx.subscription != null && ctx.subscription.isActive()) {
-          try {
-            Connection conn = ctx.connection;
-            if (conn != null && conn.getStatus() == Connection.Status.CONNECTED) {
-              LOGGER.debug("Reusing push-queue subscription: {} (generation {})", key, currentGen);
-              return (Subscription) ctx.subscription;
-            }
-          } catch (Exception e) {
-            LOGGER.info("Validation failed for existing push-queue subscription {}, recreating: {}", key, e.getMessage(), e);
-          }
-        }
-      }
-
-      if (ctx != null) {
-        cleanupConsumerContext(key, ctx);
-        consumerPool.remove(key);
-      }
-
-      Connection conn = natsTlsClient.getConnectionForNewOperations();
-      if (conn == null || conn.getStatus() != Connection.Status.CONNECTED) {
-        throw new IllegalStateException("No NATS connection available for push queue subscribe");
-      }
-
-      Dispatcher dispatcher = conn.createDispatcher();
-      LOGGER.info("Subscribing to push-queue: subject={} queue={} (gen={})", deliverSubject, queueGroup, currentGen);
-
-      // Build PushSubscribeOptions with deliverGroup
-      PushSubscribeOptions pushOpts = PushSubscribeOptions.builder()
-        .deliverGroup(queueGroup)
-        .build();
-
-      // Use dispatcher-first overload: subscribe(subject, dispatcher, handler, autoAck, pushOpts)
-      JetStreamSubscription jss = conn.jetStream().subscribe(deliverSubject, dispatcher, handler, false, pushOpts);
-
-      ConsumerContext newCtx = new ConsumerContext(jss, dispatcher, conn, currentGen);
-      consumerPool.put(key, newCtx);
-
-      LOGGER.info("Attached push-queue subscription: {} (generation {})", key, currentGen);
-      return (Subscription) jss;
-    });
-  }
-   */
-
-  /**
-   * Attach/bind to an existing server-side pull durable consumer by durable name.
-   * This binds the client subscription to the server durable (no admin create attempted).
-   *
-   * NOTE: register descriptor with createdByManager = false (admin-owned).
-   *
-   * NOTE: This code path uses push-style handler attach as a fallback for
-   * environments that only use push deliveries. If you need true pull-mode,
-   * implement a dedicated pull-mode attach + fetch loop.
-  public Future<Subscription> attachPullConsumer(String subject, String durableName, MessageHandler handler) {
-    return vertx.executeBlocking(() -> {
-      String key = subject + ":" + durableName;
-      long currentGen = currentCertificateGeneration;
-
-      // Register descriptor as admin-owned (we did NOT create the server durable)
-      consumerRegistry.putIfAbsent(key, new ConsumerDescriptor(subject, durableName, handler, ConsumerType.PULL_DURABLE, false));
-
-      ConsumerContext ctx = consumerPool.get(key);
-      if (ctx != null && ctx.generation == currentGen) {
-        if (ctx.subscription != null && ctx.subscription.isActive()) {
-          try {
-            Connection conn = ctx.connection;
-            if (conn != null && conn.getStatus() == Connection.Status.CONNECTED) {
-              LOGGER.debug("Reusing pull-bound subscription: {} (generation {})", key, currentGen);
-              return (Subscription) ctx.subscription;
-            }
-          } catch (Exception e) {
-            LOGGER.info("Validation failed for existing pull-bound subscription {}, recreating: {}", key, e.getMessage());
-          }
-        }
-      }
-
-      if (ctx != null) {
-        cleanupConsumerContext(key, ctx);
-        consumerPool.remove(key);
-      }
-
-      Connection conn = natsTlsClient.getConnectionForNewOperations();
-      if (conn == null || conn.getStatus() != Connection.Status.CONNECTED) {
-        throw new IllegalStateException("No NATS connection available for pull bind");
-      }
-
-      LOGGER.info("Binding to pull-durable fallback (push subscribe) subject={} durable={} (gen={})", subject, durableName, currentGen);
-
-      // Fallback: your runtime uses push-mode only. Create a push-style subscription
-      // that attaches to the subject and delivers to the provided handler.
-      Dispatcher dispatcher = conn.createDispatcher();
-      JetStreamSubscription jss = conn.jetStream().subscribe(subject, dispatcher, handler, false);
-
-      ConsumerContext newCtx = new ConsumerContext(jss, dispatcher, conn, currentGen);
-      consumerPool.put(key, newCtx);
-
-      LOGGER.info("Attached (push-fallback) subscription for key={} (generation {})", key, currentGen);
-      return (Subscription) jss;
-    });
-  }
-   */
-
-  /**
-   * Helper: cleanup consumer context asynchronously (delegates to blocking method).
-   */
-  private void cleanupConsumerContext(String key, ConsumerContext ctx)
-  {
-    if (ctx == null) return;
-
-    try
-    {
-      workerExecutor.executeBlocking(() -> {
-        cleanupConsumerContextBlocking(key, ctx);
-        return null;
-      }).onComplete(ar -> {
-        if (ar.failed()) {
-          LOGGER.warn("Async cleanup failed for {}: {}", key, ar.cause() != null ? ar.cause().getMessage() : "unknown");
-        } else {
-          LOGGER.debug("Async cleanup completed for {}", key);
-        }
-      });
-    }
-    catch (Exception e)
-    {
-      LOGGER.warn("Failed to offload consumer cleanup to worker for {}: {}. Doing inline cleanup.", key, e.getMessage());
-      cleanupConsumerContextBlocking(key, ctx);
-    }
-  }
-
-  /**
-   * Properly cleanup a ConsumerContext (blocking).
-   *
-   * Updated to support both JetStreamSubscription and plain Subscription.
-   */
-  private void cleanupConsumerContextBlocking(String key, ConsumerContext ctx)
-  {
-    if (ctx == null) return;
-
-    LOGGER.info("Cleaning up consumer context: {}", key);
-
-    JetStreamSubscription jss = ctx.getJsSubscription();
-    Subscription plainSub = ctx.getPlainSubscription();
-
-    // If this is a JetStream subscription, prefer graceful drain then unsubscribe
-    if (jss != null) {
-      boolean drained = false;
-      try {
-        try {
-          jss.drain(Duration.ofMillis(200));
-          drained = true;
-        } catch (Throwable t) {
-          // fallback to unsubscribe
-          LOGGER.debug("Quick drain not available/failed for {}: {}", key, t.getMessage());
-        }
-
-        if (!drained) {
-          try { jss.unsubscribe(); } catch (Exception ignore) {}
-        } else {
-          try { jss.unsubscribe(); } catch (Exception ignore) {}
-        }
-      } catch (Throwable t) {
-        LOGGER.debug("Error during JetStream subscription cleanup for {}: {}", key, t.getMessage(), t);
-      }
-    } else if (plainSub != null) {
-      // Plain NATS subscription - just unsubscribe
-      try {
-        plainSub.unsubscribe();
-      } catch (Throwable t) {
-        LOGGER.debug("Unsubscribe failed for plain subscription {}: {}", key, t.getMessage());
-      }
+      throw new IllegalStateException("Cannot start - manager is shutdown");
     }
 
-    LOGGER.debug("Dropped dispatcher reference for {}", key);
+    // Start periodic cleanup
+    cleanupTimerId = vertx.setPeriodic(CLEANUP_INTERVAL.toMillis(), this::performCleanup);
+
+    LOGGER.info("NatsConsumerPoolManager started - cleanup interval: {}min", CLEANUP_INTERVAL.toMinutes());
   }
-  
+
   /**
-   * Properly cleanup a ConsumerContext (blocking).
-  private void cleanupConsumerContextBlocking(String key, ConsumerContext ctx)
+   * Get or create a pooled consumer for a subject and consumer name
+   * Enhanced to support graceful migration and automatic registration.
+   * Returns Future immediately and uses async operations
+   */
+  public Future<Subscription> getOrCreateConsumer(String subject, String consumerName,
+                                                  MessageHandler handler)
   {
-    if (ctx == null) return;
-
-    LOGGER.info("Cleaning up consumer context: {}", key);
-
-    JetStreamSubscription jss = ctx.subscription;
-    if (jss != null) {
-      boolean drained = false;
-      try {
-        // Try drain(duration) if available, else unsubscribe
-        try {
-          jss.drain(Duration.ofMillis(200));
-          drained = true;
-        } catch (Throwable t) {
-          // fallback to unsubscribe
-          LOGGER.debug("Quick drain not available/failed for {}: {}", key, t.getMessage());
-        }
-
-        if (!drained) {
-          try { jss.unsubscribe(); } catch (Exception ignore) {}
-        } else {
-          try { jss.unsubscribe(); } catch (Exception ignore) {}
-        }
-      } catch (Throwable t) {
-        LOGGER.debug("Error during subscription cleanup for {}: {}", key, t.getMessage(), t);
-      }
+    if (isShutdown)
+    {
+      return Future.failedFuture(new IllegalStateException("Consumer pool manager is shutdown"));
     }
 
-    LOGGER.debug("Dropped dispatcher reference for {}", key);
+    if (subject == null || consumerName == null || handler == null)
+    {
+      return Future.failedFuture(new IllegalArgumentException("Subject, consumer name and handler must not be null"));
+    }
+
+    String key = generateConsumerKey(subject, consumerName);
+
+    // Ensure registry records this consumer request (so migration will warm it up)
+    // Use putIfAbsent to avoid overwriting existing descriptor/handler
+    registeredConsumers.putIfAbsent(key, new ConsumerDescriptor(subject, consumerName, handler));
+
+    // Determine which connection and generation to use
+    Connection connectionToUse = migrationInProgress && newConnection != null ?
+                                 newConnection : natsTlsClient.getConnectionForNewOperations();
+
+    long generation = migrationInProgress ? migrationGeneration : currentCertificateGeneration;
+
+    return getOrCreateConsumerWithConnection(key, subject, consumerName, handler, connectionToUse, generation);
   }
-   */
 
   /**
-   * Implement CertificateUpdateCallbackIF: handle certificate update event
-   * by bumping generation and migrating consumers.
-   *
-   * Non-blocking: schedule migration on workerExecutor so event-loop is never blocked.
+   * Get or create consumer with specific connection and generation
+   * Made fully async to prevent thread blocking
    */
-  @Override
-  public void onCertificateUpdated()
+  private Future<Subscription> getOrCreateConsumerWithConnection(String key, String subject,
+                                                                String consumerName,
+                                                                MessageHandler handler,
+                                                                Connection connection, long generation)
   {
-    long oldGeneration = currentCertificateGeneration;
-    long newGeneration = generationCounter.incrementAndGet();
-    
-    // CRITICAL: Update currentCertificateGeneration BEFORE starting migration
-    currentCertificateGeneration = newGeneration;
+    // Check if we have a valid consumer for this generation
+    PooledConsumer pooled = pool.get(key);
+    if (pooled != null && pooled.isValid(generation))
+    {
+      pooled.updateLastUsed();
+      totalPoolHits.incrementAndGet();
+      LOGGER.debug("Consumer pool HIT for key: {} - generation: {}", key, generation);
+      // Ensure descriptor exists in registry (idempotent)
+      registeredConsumers.putIfAbsent(key, new ConsumerDescriptor(subject, consumerName, handler));
+      return Future.succeededFuture(pooled.subscription);
+    }
 
-    LOGGER.info("Consumer pool: Certificate updated - old gen: {}, new gen: {}", 
-      oldGeneration, newGeneration);
+    // Pool miss - create new consumer ASYNCHRONOUSLY
+    totalPoolMisses.incrementAndGet();
+    LOGGER.debug("Consumer pool MISS for key: {} - creating new consumer with generation: {}", key, generation);
 
-    // FIXED: Don't wrap migration in executeBlocking - let it manage its own threading
-    // The async migration already handles worker thread coordination
-    migrateConsumersToNewGenerationAsync(oldGeneration, newGeneration).onComplete(ar -> {
-      if (ar.failed())
+    return createNewConsumerWithConnectionAsync(subject, consumerName, handler, connection, generation)
+             .onSuccess(consumer ->
+             {
+               // Store in pool
+               PooledConsumer newPooledConsumer = new PooledConsumer(consumer, generation);
+               pool.put(key, newPooledConsumer);
+               // Register descriptor so future migrations will warm-up this consumer
+               registeredConsumers.putIfAbsent(key, new ConsumerDescriptor(subject, consumerName, handler));
+               LOGGER.debug("Added new consumer to pool and registry: {} - generation: {}", key, generation);
+             });
+  }
+
+  /**
+   * Create new consumer with specific connection and generation
+   * Made this properly async using vertx.executeBlocking with timeout
+   * Enhanced error handling for consumer creation with rotation-aware logging
+   */
+  private Future<Subscription> createNewConsumerWithConnectionAsync( String subject, String consumerName, 
+                                                                     MessageHandler handler, Connection connection, 
+                                                                     long generation)
+  {
+    Promise<Subscription> promise = Promise.promise();
+
+    vertx.executeBlocking(() -> 
+    {
+      try
       {
-        LOGGER.warn("Consumer migration encountered errors: {}", 
-          ar.cause() != null ? ar.cause().getMessage() : "unknown", ar.cause());
+        if (connection == null || connection.getStatus() != Connection.Status.CONNECTED)
+        {
+          throw new RuntimeException("NATS Connection not available or not connected");
+        }
+
+        // For JetStream consumers, we need to create a durable consumer
+        JetStream js = connection.jetStream();
+//        JetStreamManagement jsm = connection.jetStreamManagement();
+
+        // Create consumer configuration
+        ConsumerConfiguration consumerConfig = ConsumerConfiguration.builder()
+            .durable(consumerName)
+            .deliverSubject(subject + ".deliver")
+            .ackWait(Duration.ofSeconds(30))
+            .maxDeliver(3)
+            .build();
+
+        // Create push subscription
+        PushSubscribeOptions pushOptions = PushSubscribeOptions.builder()
+            .configuration(consumerConfig)
+            .build();
+
+        JetStreamSubscription subscription = js.subscribe( subject, consumerName, pushOptions);//        subscription.setMessageHandler(handler);
+       
+        totalConsumersCreated.incrementAndGet();
+        currentActiveConsumers.incrementAndGet();
+
+        LOGGER.info("Created new NATS consumer for subject: {}, consumer: {} (generation: {})", 
+                   subject, consumerName, generation);
+        return subscription;
+      } 
+      catch (Exception e)
+      {
+        // Use enhanced rotation-aware error logging
+        String errorMessage = String.format("Failed to create consumer for subject: %s, consumer: %s", 
+                                           subject, consumerName);
+
+        // Enhanced error suppression during rotation
+        CaRotationWindowManager.logPulsarConnectionError(LOGGER, errorMessage, e);
+
+        throw new RuntimeException("Consumer creation failed", e);
       }
+    }).onComplete(ar -> {
+      if (ar.succeeded())
+      {
+        promise.complete(ar.result());
+      } 
       else
       {
-        LOGGER.info("Consumer migration completed: gen {} → {}", oldGeneration, newGeneration);
+        // Additional suppression for promise failures during rotation
+        Throwable cause = ar.cause();
+        if (!CaRotationWindowManager.shouldSuppressDuringRotation(cause))
+        {
+          LOGGER.error("Consumer creation promise failed for subject: {}, consumer: {}", subject, consumerName, cause);
+        } 
+        else
+        {
+          LOGGER.debug("Consumer creation failed during CA rotation (suppressed): {}", cause.getMessage());
+        }
+        promise.fail(cause);
       }
+    });
+
+    return promise.future();
+  }
+
+  // ===== GRACEFUL MIGRATION SUPPORT =====
+
+  /**
+   * Start graceful migration to new connection
+   *
+   * Now warms up all registered consumers on the new connection/generation.
+   */
+  @Override
+  public void startGracefulMigration(Connection newConnection, long newGeneration)
+  {
+    this.newConnection = newConnection;
+    this.migrationGeneration = newGeneration;
+    this.migrationInProgress = true;
+
+    LOGGER.info("Starting graceful migration - generation: {} -> {}", currentCertificateGeneration, newGeneration);
+
+    // Start timer to gradually drain old connections
+    startConnectionDraining();
+
+    // Warm-up all registered consumers on the new connection/generation
+    // ASYNCHRONOUSLY
+    if (!registeredConsumers.isEmpty())
+    {
+      LOGGER.info("Warming up {} registered consumers for generation {}", registeredConsumers.size(), newGeneration);
+      for (Map.Entry<String, ConsumerDescriptor> e : registeredConsumers.entrySet())
+      {
+        ConsumerDescriptor d = e.getValue();
+        final String key = e.getKey();
+        // Attempt to create consumer with the new connection and generation ASYNC
+        getOrCreateConsumerWithConnection(key, d.subject, d.consumerName, d.handler, newConnection, newGeneration)
+          .onSuccess(c -> {
+            LOGGER.info("Warm-up: created/reused consumer for {} / {}", d.subject, d.consumerName);
+          })
+          .onFailure(err -> {
+            LOGGER.warn("Warm-up: failed to create consumer for {} / {} - {}", d.subject, d.consumerName, err.getMessage());
+          });
+      }
+    }
+  }
+
+  /**
+   * Complete migration process
+   */
+  @Override
+  public void completeMigration()
+  {
+    LOGGER.info("=== CONSUMER POOL MIGRATION COMPLETION ===");
+    LOGGER.info("Completing graceful migration - generation: {} at {}", migrationGeneration, Instant.now());
+
+    int activeConsumers          = pool.size();
+    int registeredConsumerCount  = registeredConsumers.size();
+    int oldGenerationConnections = getActiveOldGenerationConnections();
+
+    LOGGER.info("Consumer Pool Status - Active: {}, Registered: {}, Old Generation: {}", 
+               activeConsumers, registeredConsumerCount, oldGenerationConnections);
+
+    migrationInProgress = false;
+    currentCertificateGeneration = migrationGeneration;
+    newConnection = null;
+
+    // Cancel drainage timer if running
+    if (drainageTimerId != -1)
+    {
+      vertx.cancelTimer(drainageTimerId);
+      drainageTimerId = -1;
+      LOGGER.info("Connection drainage timer cancelled");
+    }
+
+    LOGGER.info("Consumer Pool Migration Complete - All new connections using generation: {}", currentCertificateGeneration);
+    LOGGER.info("=== CONSUMER POOL READY ===");
+  }
+
+  /**
+   * Rollback migration on failure
+   */
+  @Override
+  public void rollbackMigration()
+  {
+    LOGGER.warn("Rolling back graceful migration - generation: {}", migrationGeneration);
+
+    migrationInProgress = false;
+    newConnection       = null;
+    migrationGeneration = 0;
+
+    // Cancel drainage timer if running
+    if (drainageTimerId != -1)
+    {
+      vertx.cancelTimer(drainageTimerId);
+      drainageTimerId = -1;
+    }
+
+    LOGGER.info("Migration rollback completed - continuing with generation: {}", currentCertificateGeneration);
+  }
+
+  /**
+   * Get count of active old generation connections
+   */
+  @Override
+  public int getActiveOldGenerationConnections()
+  {
+    if (!migrationInProgress)
+    {
+      return 0;
+    }
+
+    return (int) pool.values()
+                     .stream()
+                     .filter(p -> p.getCertificateGeneration() < migrationGeneration)
+                     .count();
+  }
+
+  /**
+   * Start connection draining process
+   */
+  private void startConnectionDraining()
+  {
+    LOGGER.info("Starting connection drainage for migration");
+
+    // Timer to periodically check and close idle old connections
+    drainageTimerId = vertx.setPeriodic(DRAINAGE_CHECK_INTERVAL.toMillis(), timerId -> 
+    {
+      if (!migrationInProgress) {
+        vertx.cancelTimer(timerId);
+        drainageTimerId = -1;
+        return;
+      }
+
+      // Execute blocking draining logic off the event loop with timeout
+      vertx.executeBlocking(() -> 
+      {
+        return drainIdleOldConnections();
+      })
+      .onComplete(ar -> 
+      {
+        if (ar.succeeded()) 
+        {
+          LOGGER.debug("Drained {} old connections", ar.result());
+        } 
+        else 
+        {
+          LOGGER.warn("Drain failed: {}", ar.cause().getMessage());
+        }
+      });
     });
   }
   
+  /**
+   * Close idle connections from old generation
+   */
+  private int drainIdleOldConnections()
+  {
+    Instant cutoff = Instant.now().minus(IDLE_CONNECTION_THRESHOLD);
+    int drainedCount = 0;
+
+    Iterator<Map.Entry<String, PooledConsumer>> iterator = pool.entrySet().iterator();
+    while (iterator.hasNext())
+    {
+      Map.Entry<String, PooledConsumer> entry = iterator.next();
+      PooledConsumer pooled = entry.getValue();
+
+      // Close old generation connections that have been idle
+      if (pooled.getCertificateGeneration() < migrationGeneration && pooled.getLastUsed().isBefore(cutoff))
+      {
+        iterator.remove();
+
+        try
+        {
+          closeConsumer(pooled.subscription, "migration-drain");
+          drainedCount++;
+          LOGGER.debug("Drained idle old connection for consumer: {}", entry.getKey());
+        } 
+        catch (Exception e)
+        {
+          // Use rotation-aware logging for drain errors
+          CaRotationWindowManager.logConnectionError(LOGGER, 
+            String.format("Error draining consumer %s", entry.getKey()), e);
+        }
+      }
+    }
+
+    return drainedCount;
+  }
+
+  // ===== CERTIFICATE UPDATE CALLBACKS =====
+
+  /**
+   * Implementation of CertificateUpdateCallbackIF
+   * Called when certificates are rotated (fallback for non-graceful rotation)
+   * IMPROVED: Better error handling and recovery
+   */
+  public void onCertificateUpdated()
+  {
+    // If graceful migration is in progress, this is handled by the migration
+    // process
+    if (migrationInProgress)
+    {
+      LOGGER.info("Certificate update received during graceful migration - handled by migration process");
+      return;
+    }
+
+    // Add delay and retry logic for the fallback path
+    long newGeneration = generationCounter.incrementAndGet();
+    long oldGeneration = currentCertificateGeneration;
+    currentCertificateGeneration = newGeneration;
+
+    LOGGER.warn("Using fallback certificate rotation path - this may indicate graceful migration failed");
+    LOGGER.info("Certificate rotation detected - invalidating all consumers (generation: {} -> {})", 
+               oldGeneration, newGeneration);
+
+    int consumerCount = pool.size();
+
+    // Start suppression window if not already active
+    if (!CaRotationWindowManager.isWithinRotationWindow())
+    {
+      CaRotationWindowManager.markRotationStart();
+      LOGGER.info("Started CA rotation window for fallback certificate rotation");
+    }
+
+    // Add a small delay to allow any in-flight operations to complete, then
+    // process async
+    vertx.setTimer(2000, timerId -> {
+      vertx.executeBlocking(() -> {
+        invalidateAllConsumers();
+
+        // Optionally attempt to pre-warm critical consumers
+        preWarmCriticalConsumers(newGeneration);
+
+        return null;
+      }).onComplete(ar -> {
+        if (ar.succeeded())
+        {
+          LOGGER.info("Fallback certificate rotation complete - invalidated {} consumers", consumerCount);
+        } 
+        else
+        {
+          LOGGER.error("Fallback certificate rotation invalidation failed", ar.cause());
+        }
+
+        // End suppression window after a delay to allow connections to
+        // stabilize
+        vertx.setTimer(30000, id -> {
+          CaRotationWindowManager.markRotationEnd();
+          LOGGER.info("CA rotation window ended for fallback rotation");
+        });
+      });
+    });
+  }
+  
+  /**
+   * Pre-warm critical consumers async to reduce recovery time
+   */
+  private void preWarmCriticalConsumers(long generation) 
+  {
+    // Pre-create consumers for critical subjects to reduce recovery time
+    for (Map.Entry<String, ConsumerDescriptor> entry : registeredConsumers.entrySet()) 
+    {
+      ConsumerDescriptor desc = entry.getValue();
+      try 
+      {
+        // Use async creation to prevent blocking
+        createNewConsumerWithConnectionAsync(desc.subject, desc.consumerName, 
+                                            desc.handler, natsTlsClient.getConnectionForNewOperations(), generation)
+          .onSuccess(consumer -> {
+            PooledConsumer pooledConsumer = new PooledConsumer(consumer, generation);
+            pool.put(entry.getKey(), pooledConsumer);
+            LOGGER.info("Pre-warmed critical consumer: {}", entry.getKey());
+          })
+          .onFailure(err -> {
+            LOGGER.warn("Failed to pre-warm critical consumer {}: {}", entry.getKey(), err.getMessage());
+          });
+      } 
+      catch (Exception e) 
+      {
+        LOGGER.warn("Failed to pre-warm critical consumer {}: {}", entry.getKey(), e.getMessage());
+      }
+    }
+  }
+ 
   @Override
   public void onCertificateUpdateFailed(Exception error)
   {
-    LOGGER.error("Certificate update failed in consumer pool", error);
+    LOGGER.error("Consumer pool manager certificate update failed", error);
+  }
+
+  // ===== POOL MANAGEMENT =====
+
+  /**
+   * Invalidate all consumers (bulk operation for certificate rotation)
+   */
+  private void invalidateAllConsumers()
+  {
+    LOGGER.info("Invalidating all consumers due to certificate rotation");
+
+    // Close all consumers and clear pool
+    pool.forEach((key, pooled) ->
+    {
+      closeConsumer(pooled.subscription, "certificate-rotation");
+    });
+
+    pool.clear();
+    LOGGER.info("All consumers invalidated due to certificate rotation");
   }
 
   /**
-   * Asynchronous, non-blocking migration that attempts to reattach to admin-managed
-   * consumers on the new connection. Per-consumer retries/backoff tolerates transient races.
+   * Periodic cleanup of expired consumers
    */
-  private Future<Void> migrateConsumersToNewGenerationAsync(long oldGen, long newGen)
+  private void performCleanup(Long timerId)
   {
-    Promise<Void> overall = Promise.promise();
-    
-    // Set overall timeout for migration
-    long timeoutId = vertx.setTimer(90000, id -> {
-      if (!overall.future().isComplete())
+    if (isShutdown)
+    {
+      return;
+    }
+
+    vertx.executeBlocking(() ->
+    {
+      try
       {
-        LOGGER.error("Consumer migration timed out after 90 seconds");
-        overall.fail("Migration timeout");
-      }
-    });
+        Instant now = Instant.now();
+        int closedCount = 0;
 
-    Map<String, ConsumerDescriptor> descriptors = new HashMap<>(consumerRegistry);
-    Map<String, ConsumerContext> oldConsumers = new HashMap<>(consumerPool);
-
-    LOGGER.info("Migrating consumers: gen {} → gen {} ({} descriptors)", 
-      oldGen, newGen, descriptors.size());
-
-    if (descriptors.isEmpty())
-    {
-      drainOldConsumers(oldConsumers, oldGen);
-      vertx.cancelTimer(timeoutId);
-      overall.complete();
-      return overall.future();
-    }
-
-    List<String> descriptorKeys = new ArrayList<>(descriptors.keySet());
-    List<Future<ConsumerContext>> safeFutures = new ArrayList<>(descriptorKeys.size());
-
-    for (String regKey : descriptorKeys)
-    {
-      ConsumerDescriptor desc = descriptors.get(regKey);
-
-      Promise<ConsumerContext> attachPromise = Promise.promise();
-      
-      // FIXED: Add timeout per consumer attempt
-      long consumerTimeoutId = vertx.setTimer(30000, id -> {
-        if (!attachPromise.future().isComplete())
+        Iterator<Map.Entry<String, PooledConsumer>> iterator = pool.entrySet().iterator();
+        while (iterator.hasNext())
         {
-          LOGGER.warn("Reattach timeout for {}", desc.getSubject());
-          attachPromise.fail("Consumer reattach timeout");
+          Map.Entry<String, PooledConsumer> entry = iterator.next();
+          PooledConsumer pooledConsumer = entry.getValue();
+
+          if (!pooledConsumer.isValid(currentCertificateGeneration) ||
+              pooledConsumer.isExpired(now, CONSUMER_TTL))
+          {
+            iterator.remove();
+            closeConsumer(pooledConsumer.subscription, "cleanup-expired");
+            closedCount++;
+          }
         }
-      });
-      
-      attemptReattach(desc, newGen, 1, 3, attachPromise);
-      
-      // Cancel timeout on completion
-      attachPromise.future().onComplete(ar -> vertx.cancelTimer(consumerTimeoutId));
 
-      Future<ConsumerContext> safe = attachPromise.future().recover(err -> {
-        LOGGER.debug("Reattach failed for {}: {}", desc.getSubject(), 
-          err == null ? "null" : err.getMessage());
-        return Future.succeededFuture((ConsumerContext) null);
-      });
-
-      safeFutures.add(safe);
-    }
-
-    // Aggregate all consumer reattach attempts
-    final int total = safeFutures.size();
-    final AtomicInteger remaining = new AtomicInteger(total);
-    final Map<Integer, ConsumerContext> resultsByIndex = new ConcurrentHashMap<>();
-
-    for (int i = 0; i < safeFutures.size(); i++)
-    {
-      final int idx = i;
-      Future<ConsumerContext> f = safeFutures.get(i);
-      
-      f.onComplete(ar -> {
-        if (ar.succeeded())
+        if (closedCount > 0)
         {
-          resultsByIndex.put(idx, ar.result());
+          LOGGER.info("Pool cleanup: closed {} expired consumers (remaining: {})", closedCount, pool.size());
         }
         else
         {
-          resultsByIndex.put(idx, null);
+          LOGGER.debug("Pool cleanup: no expired consumers (active: {})", pool.size());
         }
-
-        if (remaining.decrementAndGet() == 0)
-        {
-          // All completed - process results
-          Map<String, ConsumerContext> created = new HashMap<>();
-          int successCount = 0;
-          int failCount = 0;
-          
-          for (int j = 0; j < descriptorKeys.size(); j++)
-          {
-            String regKey = descriptorKeys.get(j);
-            ConsumerContext ctx = resultsByIndex.get(j);
-            
-            if (ctx != null)
-            {
-              created.put(regKey, ctx);
-              successCount++;
-              LOGGER.info("Reattached consumer registryKey={} (gen {})", regKey, newGen);
-            }
-            else
-            {
-              failCount++;
-              LOGGER.warn("Failed to reattach consumer registryKey={}", regKey);
-            }
-          }
-
-          // Activate newly created contexts
-          for (Map.Entry<String, ConsumerContext> e : created.entrySet())
-          {
-            consumerPool.put(e.getKey(), e.getValue());
-          }
-          
-          LOGGER.info("Activated {} consumers (success: {}, failed: {})", 
-            created.size(), successCount, failCount);
-
-          // Drain old-generation contexts
-          drainOldConsumers(oldConsumers, oldGen);
-
-          vertx.cancelTimer(timeoutId);
-          
-          if (failCount > 0)
-          {
-            overall.fail("Failed to reattach " + failCount + " consumers");
-          }
-          else
-          {
-            overall.complete();
-          }
-        }
-      });
-    }
-
-    return overall.future();
-  }
- 
-  /**
-   * Attempt to reattach a descriptor with retries and exponential backoff.
-   * - attempts: current attempt number (1-based)
-   * - maxAttempts: maximum attempts
-   *
-   * NOTE: on successful attach, the code now builds ConsumerContext that holds
-   * either a JetStreamSubscription or a plain Subscription depending on the returned type.
-   */
-  private void attemptReattach( ConsumerDescriptor desc, long targetGeneration, int attempt, int maxAttempts, Promise<ConsumerContext> promise )
-  {
-    LOGGER.info( "Reattaching {} (attempt {}/{})", desc.getSubject(), attempt, maxAttempts );
-
-    // Check if we should abort due to generation change
-    if( targetGeneration < currentCertificateGeneration )
-    {
-      LOGGER.warn( "Aborting reattach for {} - generation changed during attempt", desc.getSubject() );
-      promise.fail( "Generation changed during reattach" );
-      return;
-    }
-
-    Future<Subscription> attachFuture;
-    try
-    {
-      if( desc.getType() == ConsumerType.PUSH_QUEUE )
-      {
-        attachFuture = attachPushQueue( desc.getSubject(), desc.getConsumerNameOrQueue(), desc.getHandler() );
-      }
-      else
-      {
-        attachFuture = attachPullConsumer( desc.getSubject(), desc.getConsumerNameOrQueue(), desc.getHandler() );
-      }
-    }
-    catch( Exception e )
-    {
-      LOGGER.warn( "Exception creating reattach future: {}", e.getMessage(), e );
-      handleReattachFailure( desc, targetGeneration, attempt, maxAttempts, promise, e );
-      return;
-    }
-
-    attachFuture.onComplete( ar -> {
-      if( ar.succeeded() )
-      {
-        try
-        {
-          Subscription sub = ar.result();
-          Connection conn = natsTlsClient.getConnectionForNewOperations();
-
-          if( conn == null )
-          {
-            throw new IllegalStateException( "No connection available after reattach" );
-          }
-
-          Dispatcher dispatcher = conn.createDispatcher();
-
-          JetStreamSubscription jss = null;
-          if (sub instanceof JetStreamSubscription) {
-            jss = (JetStreamSubscription) sub;
-          }
-
-          ConsumerContext ctx = new ConsumerContext(jss, sub, dispatcher, conn, targetGeneration);
-
-          promise.complete( ctx );
-        }
-        catch( Exception e )
-        {
-          LOGGER.warn( "Failed to build context after successful attach: {}", e.getMessage(), e );
-          handleReattachFailure( desc, targetGeneration, attempt, maxAttempts, promise, e );
-        }
-      }
-      else
-      {
-        LOGGER.warn( "Reattach attempt {}/{} failed for {}: {}", attempt, maxAttempts, desc.getSubject(), ar.cause() != null ? ar.cause().getMessage() : "unknown" );
-        handleReattachFailure( desc, targetGeneration, attempt, maxAttempts, promise, ar.cause() );
-      }
-    } );
-  }
-
-  /**
-   * Attempt to reattach a descriptor with retries and exponential backoff.
-   * - attempts: current attempt number (1-based)
-   * - maxAttempts: maximum attempts
-  private void attemptReattach( ConsumerDescriptor desc, long targetGeneration, int attempt, int maxAttempts, Promise<ConsumerContext> promise )
-  {
-    LOGGER.info( "Reattaching {} (attempt {}/{})", desc.getSubject(), attempt, maxAttempts );
-
-    // Check if we should abort due to generation change
-    if( targetGeneration < currentCertificateGeneration )
-    {
-      LOGGER.warn( "Aborting reattach for {} - generation changed during attempt", desc.getSubject() );
-      promise.fail( "Generation changed during reattach" );
-      return;
-    }
-
-    Future<Subscription> attachFuture;
-    try
-    {
-      if( desc.getType() == ConsumerType.PUSH_QUEUE )
-      {
-        attachFuture = attachPushQueue( desc.getSubject(), desc.getConsumerNameOrQueue(), desc.getHandler() );
-      }
-      else
-      {
-        attachFuture = attachPullConsumer( desc.getSubject(), desc.getConsumerNameOrQueue(), desc.getHandler() );
-      }
-    }
-    catch( Exception e )
-    {
-      LOGGER.warn( "Exception creating reattach future: {}", e.getMessage(), e );
-      handleReattachFailure( desc, targetGeneration, attempt, maxAttempts, promise, e );
-      return;
-    }
-
-    attachFuture.onComplete( ar -> {
-      if( ar.succeeded() )
-      {
-        try
-        {
-          Subscription sub = ar.result();
-          Connection conn = natsTlsClient.getConnectionForNewOperations();
-
-          if( conn == null )
-          {
-            throw new IllegalStateException( "No connection available after reattach" );
-          }
-
-          Dispatcher dispatcher = conn.createDispatcher();
-          ConsumerContext ctx = new ConsumerContext( (JetStreamSubscription)sub, dispatcher, conn, targetGeneration );
-
-          promise.complete( ctx );
-        }
-        catch( Exception e )
-        {
-          LOGGER.warn( "Failed to build context after successful attach: {}", e.getMessage(), e );
-          handleReattachFailure( desc, targetGeneration, attempt, maxAttempts, promise, e );
-        }
-      }
-      else
-      {
-        LOGGER.warn( "Reattach attempt {}/{} failed for {}: {}", attempt, maxAttempts, desc.getSubject(), ar.cause() != null ? ar.cause().getMessage() : "unknown" );
-        handleReattachFailure( desc, targetGeneration, attempt, maxAttempts, promise, ar.cause() );
-      }
-    } );
-  }
-   */
-  
-  private void handleReattachFailure( ConsumerDescriptor desc, long targetGeneration, int attempt, int maxAttempts, Promise<ConsumerContext> promise, Throwable cause )
-  {
-    if( attempt >= maxAttempts )
-    {
-      LOGGER.error( "Exceeded max reattach attempts ({}) for subject={}, giving up", maxAttempts, desc.getSubject() );
-      promise.fail( cause != null ? cause : new RuntimeException( "reattach failed" ) );
-      return;
-    }
-
-    // Exponential backoff (ms): 200, 400, 800, ...
-    long backoffMs = 200L * ( 1L << ( attempt - 1 ) );
-    LOGGER.info( "Scheduling retry {}/{} for subject={} after {}ms", attempt + 1, maxAttempts, desc.getSubject(), backoffMs );
-
-    vertx.setTimer( backoffMs, id -> attemptReattach( desc, targetGeneration, attempt + 1, maxAttempts, promise ) );
-  }
-
-  /**
-   * Drain/unsubscribe old-generation contexts (non-blocking scheduling)
-   */
-  private void drainOldConsumers( Map<String, ConsumerContext> oldConsumers, long oldGen )
-  {
-    for( Map.Entry<String, ConsumerContext> entry : oldConsumers.entrySet() )
-    {
-      String oldKey = entry.getKey();
-      ConsumerContext oldCtx = entry.getValue();
-      if( oldCtx.generation == oldGen )
-      {
-        LOGGER.info( "Draining old consumer: {} (gen {})", oldKey, oldGen );
-        drainingConsumers.put( oldKey, oldCtx );
-        consumerPool.remove( oldKey );
-        drainConsumerAsync( oldKey, oldCtx );
-      }
-    }
-  }
-  
-  /**
-   * Drain consumer asynchronously and clean up both client and server resources when complete
-   private void drainConsumerAsync(String key, ConsumerContext ctx)
-  {
-    if (ctx == null || ctx.subscription == null)
-    {
-      drainingConsumers.remove(key);
-      return;
-    }
-
-    LOGGER.info("Starting async drain for consumer: {} (gen {})", key, ctx.generation);
-
-    workerExecutor.executeBlocking(() ->
-    {
-      JetStreamSubscription jss = ctx.subscription;
-      String consumerName = extractConsumerName(key);
-      String subject = extractSubject(key);
-
-      try
-      {
-        try
-        {
-          jss.drain(Duration.ofSeconds(10));
-          LOGGER.info("Drain initiated for consumer: {}", key);
-
-          Thread.sleep(500);
-
-          int attempts = 0;
-          while (jss.isActive() && attempts < 20)
-          {
-            Thread.sleep(500);
-            attempts++;
-          }
-
-          if (jss.isActive())
-          {
-            LOGGER.warn("Drain timeout for consumer: {}, forcing unsubscribe", key);
-            jss.unsubscribe();
-          }
-          else
-          {
-            LOGGER.info("✅ Drain completed for consumer: {}", key);
-          }
-        }
-        catch (Exception drainEx)
-        {
-          LOGGER.warn("Drain failed for consumer: {}, forcing unsubscribe: {}", key, drainEx.getMessage());
-          try { jss.unsubscribe(); } catch (Exception unsubEx) {}
-        }
-
-        // Step 2: Clean up server-side consumer (only if manager created it)
-        deleteServerSideConsumer(ctx.connection, subject, consumerName);
 
         return null;
       }
       catch (Exception e)
       {
-        LOGGER.error("Error during async drain for consumer: {}", key, e);
+        LOGGER.error("Error during consumer pool cleanup", e);
         return null;
       }
-    }).onComplete(ar ->
-    {
-      drainingConsumers.remove(key);
-      consumerRegistry.remove(key);
-
-      if (ar.succeeded())
-      {
-        LOGGER.info("✅ Completed full cleanup (client + server) for old consumer: {}", key);
-      }
-      else
-      {
-        LOGGER.warn("Cleanup completed with errors for consumer: {}", key);
-      }
     });
   }
-  */
 
   /**
-   * Drain consumer asynchronously and clean up both client and server resources when complete
-   *
-   * Updated to support both JetStreamSubscription and plain Subscription.
+   * Close a consumer gracefully
    */
-  private void drainConsumerAsync(String key, ConsumerContext ctx)
-  {
-    if (ctx == null || ctx.getEffectiveSubscription() == null)
-    {
-      drainingConsumers.remove(key);
-      return;
-    }
-
-    // FIXED: Limit concurrent drain operations to prevent thread pool exhaustion
-    int drainCount = activeDrainOperations.incrementAndGet();
-    if (drainCount > MAX_CONCURRENT_DRAINS)
-    {
-      LOGGER.warn("Too many concurrent drain operations ({}), deferring drain of {}", 
-        drainCount, key);
-      
-      activeDrainOperations.decrementAndGet();
-      
-      // Schedule for later (5 seconds)
-      vertx.setTimer(5000, id -> drainConsumerAsync(key, ctx));
-      return;
-    }
-
-    LOGGER.info("Starting async drain for consumer: {} (gen {}) [active drains: {}]", 
-      key, ctx.generation, drainCount);
-
-    workerExecutor.executeBlocking(() -> {
-      JetStreamSubscription jss = ctx.getJsSubscription();
-      Subscription plainSub = ctx.getPlainSubscription();
-      String consumerName = extractConsumerName(key);
-      String subject = extractSubject(key);
-
-      try
-      {
-        if (jss != null)
-        {
-          // JetStream subscription: attempt graceful drain
-          try
-          {
-            jss.drain(Duration.ofSeconds(5)); // Reduced timeout from 10 to 5
-            LOGGER.info("Drain initiated for consumer: {}", key);
-          }
-          catch (IllegalStateException ise)
-          {
-            LOGGER.debug("Drain not possible for {}: {}", key, ise.getMessage());
-          }
-          catch (Throwable drainEx)
-          {
-            LOGGER.warn("Drain failed for {}: {}", key, drainEx.getMessage());
-          }
-
-          // Wait for drain to complete with timeout
-          try
-          {
-            int attempts = 0;
-            while (jss.isActive() && attempts < 10) // Reduced from 20 to 10
-            {
-              Thread.sleep(250);
-              attempts++;
-            }
-            
-            if (jss.isActive())
-            {
-              LOGGER.warn("Drain timeout for {}, forcing unsubscribe", key);
-              try 
-              { 
-                jss.unsubscribe(); 
-              } 
-              catch (Throwable unsubEx) 
-              {
-                LOGGER.debug("Unsubscribe after timeout failed for {}", key);
-              }
-            }
-            else
-            {
-              LOGGER.info("✅ Drain completed for consumer: {}", key);
-            }
-          }
-          catch (InterruptedException ie)
-          {
-            Thread.currentThread().interrupt();
-            LOGGER.debug("Interrupted while draining {}", key);
-          }
-        }
-        else if (plainSub != null)
-        {
-          // Plain NATS subscription: unsubscribe directly (no drain)
-          try
-          {
-            plainSub.unsubscribe();
-            LOGGER.info("Unsubscribed plain deliver-subscription for {}", key);
-          }
-          catch (Throwable unsubEx)
-          {
-            LOGGER.debug("Unsubscribe for plain subscription {} failed: {}", key, unsubEx.getMessage());
-          }
-        }
-        else
-        {
-          LOGGER.debug("No subscription present for {} - skipping drain", key);
-        }
-
-        // Server-side cleanup (only if manager-created and connection active)
-        try
-        {
-          if (ctx.connection != null && 
-              ctx.connection.getStatus() == Connection.Status.CONNECTED)
-          {
-            deleteServerSideConsumer(ctx.connection, subject, consumerName);
-          }
-          else
-          {
-            LOGGER.debug("Skipping server-side deletion for {} (connection not active)", key);
-          }
-        }
-        catch (Throwable t)
-        {
-          LOGGER.warn("Server-side deletion failed for {}: {}", key, t.getMessage());
-        }
-      }
-      catch (Throwable e)
-      {
-        LOGGER.warn("Error during drain for {}: {}", key, e.getMessage());
-        // Final cleanup attempt
-        try 
-        { 
-          if (ctx.getEffectiveSubscription() != null) ctx.getEffectiveSubscription().unsubscribe(); 
-        } 
-        catch (Throwable ignore) 
-        {
-          LOGGER.debug("Final unsubscribe failed for {}", key);
-        }
-      }
-
-      return null;
-    }).onComplete(ar -> {
-      // Always decrement counter and remove from draining map
-      activeDrainOperations.decrementAndGet();
-      drainingConsumers.remove(key);
-
-      // Only remove registry entry if manager created the consumer
-      try
-      {
-        ConsumerDescriptor desc = consumerRegistry.get(key);
-        if (desc != null && desc.isCreatedByManager())
-        {
-          consumerRegistry.remove(key);
-          LOGGER.debug("Removed manager-created consumer registry entry for {}", key);
-        }
-        else
-        {
-          LOGGER.debug("Preserving registry entry for {} (admin-owned or missing)", key);
-        }
-      }
-      catch (Throwable t)
-      {
-        LOGGER.warn("Error updating registry for {}: {}", key, t.getMessage());
-      }
-
-      if (ar.succeeded())
-      {
-        LOGGER.info("✅ Completed cleanup for: {}", key);
-      }
-      else
-      {
-        LOGGER.warn("Cleanup completed with errors for: {} - {}", key, 
-          ar.cause() != null ? ar.cause().getMessage() : "unknown");
-      }
-    });
-  }
-  
-/**  
-  private void drainConsumerAsync(String key, ConsumerContext ctx)
-  {
-    if (ctx == null || ctx.subscription == null)
-    {
-      drainingConsumers.remove(key);
-      return;
-    }
-
-    // FIXED: Limit concurrent drain operations to prevent thread pool exhaustion
-    int drainCount = activeDrainOperations.incrementAndGet();
-    if (drainCount > MAX_CONCURRENT_DRAINS)
-    {
-      LOGGER.warn("Too many concurrent drain operations ({}), deferring drain of {}", 
-        drainCount, key);
-      
-      activeDrainOperations.decrementAndGet();
-      
-      // Schedule for later (5 seconds)
-      vertx.setTimer(5000, id -> drainConsumerAsync(key, ctx));
-      return;
-    }
-
-    LOGGER.info("Starting async drain for consumer: {} (gen {}) [active drains: {}]", 
-      key, ctx.generation, drainCount);
-
-    workerExecutor.executeBlocking(() -> {
-      JetStreamSubscription jss = ctx.subscription;
-      String consumerName = extractConsumerName(key);
-      String subject = extractSubject(key);
-
-      try
-      {
-        // Check if subscription is still active
-        boolean isActive = false;
-        try
-        {
-          isActive = jss.isActive();
-        }
-        catch (Throwable t)
-        {
-          LOGGER.debug("Unable to query isActive() for {}: {}", key, t.getMessage());
-        }
-
-        if (isActive)
-        {
-          // Attempt drain
-          try
-          {
-            jss.drain(Duration.ofSeconds(5)); // Reduced timeout from 10 to 5
-            LOGGER.info("Drain initiated for consumer: {}", key);
-          }
-          catch (IllegalStateException ise)
-          {
-            LOGGER.debug("Drain not possible for {}: {}", key, ise.getMessage());
-          }
-          catch (Throwable drainEx)
-          {
-            LOGGER.warn("Drain failed for {}: {}", key, drainEx.getMessage());
-          }
-
-          // Wait for drain to complete with timeout
-          try
-          {
-            int attempts = 0;
-            while (jss.isActive() && attempts < 10) // Reduced from 20 to 10
-            {
-              Thread.sleep(250);
-              attempts++;
-            }
-            
-            if (jss.isActive())
-            {
-              LOGGER.warn("Drain timeout for {}, forcing unsubscribe", key);
-              try 
-              { 
-                jss.unsubscribe(); 
-              } 
-              catch (Throwable unsubEx) 
-              {
-                LOGGER.debug("Unsubscribe after timeout failed for {}", key);
-              }
-            }
-            else
-            {
-              LOGGER.info("✅ Drain completed for consumer: {}", key);
-            }
-          }
-          catch (InterruptedException ie)
-          {
-            Thread.currentThread().interrupt();
-            LOGGER.debug("Interrupted while draining {}", key);
-          }
-        }
-        else
-        {
-          // Subscription not active - just unsubscribe
-          LOGGER.debug("Subscription not active for {} - skipping drain", key);
-          try 
-          { 
-            jss.unsubscribe(); 
-          } 
-          catch (Throwable unsubEx) 
-          {
-            LOGGER.debug("Unsubscribe for inactive subscription {} failed", key);
-          }
-        }
-
-        // Server-side cleanup (only if manager-created and connection active)
-        try
-        {
-          if (ctx.connection != null && 
-              ctx.connection.getStatus() == Connection.Status.CONNECTED)
-          {
-            deleteServerSideConsumer(ctx.connection, subject, consumerName);
-          }
-          else
-          {
-            LOGGER.debug("Skipping server-side deletion for {} (connection not active)", key);
-          }
-        }
-        catch (Throwable t)
-        {
-          LOGGER.warn("Server-side deletion failed for {}: {}", key, t.getMessage());
-        }
-      }
-      catch (Throwable e)
-      {
-        LOGGER.warn("Error during drain for {}: {}", key, e.getMessage());
-        // Final cleanup attempt
-        try 
-        { 
-          ctx.subscription.unsubscribe(); 
-        } 
-        catch (Throwable ignore) 
-        {
-          LOGGER.debug("Final unsubscribe failed for {}", key);
-        }
-      }
-
-      return null;
-    }).onComplete(ar -> {
-      // Always decrement counter and remove from draining map
-      activeDrainOperations.decrementAndGet();
-      drainingConsumers.remove(key);
-
-      // Only remove registry entry if manager created the consumer
-      try
-      {
-        ConsumerDescriptor desc = consumerRegistry.get(key);
-        if (desc != null && desc.isCreatedByManager())
-        {
-          consumerRegistry.remove(key);
-          LOGGER.debug("Removed manager-created consumer registry entry for {}", key);
-        }
-        else
-        {
-          LOGGER.debug("Preserving registry entry for {} (admin-owned or missing)", key);
-        }
-      }
-      catch (Throwable t)
-      {
-        LOGGER.warn("Error updating registry for {}: {}", key, t.getMessage());
-      }
-
-      if (ar.succeeded())
-      {
-        LOGGER.info("✅ Completed cleanup for: {}", key);
-      }
-      else
-      {
-        LOGGER.warn("Cleanup completed with errors for: {} - {}", key, 
-          ar.cause() != null ? ar.cause().getMessage() : "unknown");
-      }
-    });
-  }
-*/
-  
-  /**
-   * Invalidate all consumer subscriptions
-   */
-  private void invalidateAllConsumers()
-  {
-    LOGGER.info("Invalidating all consumer subscriptions...");
-
-    Map<String, ConsumerContext> snapshot = new HashMap<>(consumerPool);
-
-    int count = 0;
-    for (Map.Entry<String, ConsumerContext> entry : snapshot.entrySet())
-    {
-      try { cleanupConsumerContext(entry.getKey(), entry.getValue()); } catch (Throwable t) { LOGGER.warn("Error cleaning up consumer {}: {}", entry.getKey(), t.getMessage(), t); }
-      count++;
-    }
-
-    consumerPool.clear();
-    LOGGER.info("Invalidated {} consumer subscriptions", count);
-
-    if (count > 0)
-    {
-      Set<Connection> connectionsToFlush = new HashSet<>();
-      for (ConsumerContext ctx : snapshot.values())
-      {
-        if (ctx != null && ctx.connection != null) connectionsToFlush.add(ctx.connection);
-      }
-
-      if (!connectionsToFlush.isEmpty())
-      {
-        try
-        {
-          workerExecutor.executeBlocking(() ->
-          {
-            for (Connection conn : connectionsToFlush)
-            {
-              if (conn == null) continue;
-              try { if (conn.getStatus() != Connection.Status.CONNECTED) { continue; } } catch (Throwable ignored) {}
-              int[] attemptsMs = new int[] { 100, 250, 500 };
-              boolean ok = false;
-              for (int tms : attemptsMs)
-              {
-                try { conn.flush(java.time.Duration.ofMillis(tms)); ok = true; break; } catch (Throwable flushEx) { try { Thread.sleep(20); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); } }
-              }
-              if (!ok)
-              {
-                try { conn.flush(java.time.Duration.ofSeconds(2)); } catch (Throwable fallbackEx) { LOGGER.warn("Fallback flush failed for {}: {}", System.identityHashCode(conn), fallbackEx.getMessage()); }
-              }
-            }
-            return null;
-          }).onComplete(ar -> {
-            if (ar.succeeded()) LOGGER.debug("Completed flush of old connections after invalidation");
-            else LOGGER.warn("Worker flush after invalidation failed: {}", ar.cause() != null ? ar.cause().getMessage() : "unknown");
-          });
-        }
-        catch (Exception e)
-        {
-          LOGGER.warn("Failed to schedule flush task after invalidation: {}", e.getMessage(), e);
-        }
-      }
-    }
-  }
-
-  /**
-   * Delete consumer from JetStream server (guarded by createdByManager).
-   */
-  private void deleteServerSideConsumer( Connection conn, String subject, String consumerName )
-  {
-    if( conn == null || consumerName == null )
-    {
-      LOGGER.debug( "Cannot delete server consumer - missing connection or name" );
-      return;
-    }
-
-    try
-    {
-      // Look up registry entry; if absent, be defensive and skip deletion
-      // (avoids accidental deletion).
-      String keyByDurable = subject + ":" + consumerName;
-      String keyByQueue = subject + ":queue:" + consumerName;
-
-      ConsumerDescriptor desc = consumerRegistry.get( keyByDurable );
-      if( desc == null )
-        desc = consumerRegistry.get( keyByQueue );
-
-      if( desc == null )
-      {
-        LOGGER.debug( "No registry entry for consumer '{}'; skipping server-side deletion (defensive)", consumerName );
-        return;
-      }
-
-      if( !desc.isCreatedByManager() )
-      {
-        LOGGER.debug( "Skipping server-side consumer deletion for admin-owned consumer: {}", consumerName );
-        return;
-      }
-
-      if( conn.getStatus() != Connection.Status.CONNECTED )
-      {
-        LOGGER.debug( "Connection not active, skipping server-side consumer deletion for: {}", consumerName );
-        return;
-      }
-
-      JetStreamManagement jsm = conn.jetStreamManagement();
-
-      String streamName = findStreamForSubject( jsm, subject );
-
-      if( streamName == null )
-      {
-        LOGGER.warn( "Could not find stream for subject: {} (consumer: {})", subject, consumerName );
-        return;
-      }
-
-      jsm.deleteConsumer( streamName, consumerName );
-      LOGGER.info( "🗑️  Deleted server-side consumer: {} from stream: {}", consumerName, streamName );
-    }
-    catch( io.nats.client.JetStreamApiException apiEx )
-    {
-      if( apiEx.getErrorCode() == 10014 )
-        LOGGER.debug( "Server-side consumer {} already deleted or not found", consumerName );
-      else
-        LOGGER.warn( "JetStream API error deleting consumer {}: {}", consumerName, apiEx.getMessage() );
-    }
-    catch( Exception e )
-    {
-      LOGGER.warn( "Failed to delete server-side consumer {}: {}", consumerName, e.getMessage(), e );
-    }
-  }
-
-  /**
-   * Find which stream contains the given subject
-   */
-  private String findStreamForSubject(JetStreamManagement jsm, String subject)
+  private void closeConsumer(Subscription subscription, String reason)
   {
     try
     {
-      List<StreamInfo> streams = jsm.getStreams();
-
-      for (StreamInfo streamInfo : streams)
+      if (subscription != null && subscription.isActive())
       {
-        List<String> subjects = streamInfo.getConfiguration().getSubjects();
-        for (String streamSubject : subjects)
-        {
-          if (subjectMatches(subject, streamSubject)) return streamInfo.getConfiguration().getName();
-        }
+        subscription.unsubscribe();
       }
+      totalConsumersClosed.incrementAndGet();
+      currentActiveConsumers.decrementAndGet();
+      LOGGER.debug("Closed consumer (reason: {})", reason);
     }
     catch (Exception e)
     {
-      LOGGER.warn("Error finding stream for subject {}: {}", subject, e.getMessage());
+      LOGGER.warn("Error closing consumer (reason: {}): {}", reason, e.getMessage());
     }
-
-    return null;
   }
 
   /**
-   * Subject pattern matcher (supports * and >)
+   * Generate unique key for consumer based on subject and consumer name
    */
-  private boolean subjectMatches(String subject, String pattern)
+  private String generateConsumerKey(String subject, String consumerName)
   {
-    if (subject.equals(pattern)) return true;
-
-    String[] subjectTokens = subject.split("\\.");
-    String[] patternTokens = pattern.split("\\.");
-
-    if (pattern.endsWith(">"))
-    {
-      if (subjectTokens.length < patternTokens.length - 1) return false;
-      for (int i = 0; i < patternTokens.length - 1; i++)
-      {
-        if (!patternTokens[i].equals("*") && !patternTokens[i].equals(subjectTokens[i])) return false;
-      }
-      return true;
-    }
-    else
-    {
-      if (subjectTokens.length != patternTokens.length) return false;
-      for (int i = 0; i < patternTokens.length; i++)
-      {
-        if (!patternTokens[i].equals("*") && !patternTokens[i].equals(subjectTokens[i])) return false;
-      }
-      return true;
-    }
+    return subject + "::" + consumerName;
   }
 
-  private String extractConsumerName(String key)
+  // ===== MONITORING AND STATISTICS =====
+
+  /**
+   * Get pool statistics for monitoring
+   */
+  public ConsumerStatistics getStatistics()
   {
-    int colonIndex = key.lastIndexOf(':');
-    if (colonIndex > 0 && colonIndex < key.length() - 1) return key.substring(colonIndex + 1);
-    return null;
+    return new ConsumerStatistics(
+      pool.size(),
+      currentActiveConsumers.get(),
+      totalPoolHits.get(),
+      totalPoolMisses.get(),
+      totalConsumersCreated.get(),
+      totalConsumersClosed.get(),
+      currentCertificateGeneration,
+      getActiveOldGenerationConnections(),
+      migrationInProgress
+    );
   }
 
-  private String extractSubject(String key)
+  // ===== LIFECYCLE MANAGEMENT =====
+
+  /**
+   * Shutdown the consumer pool manager
+   */
+  public Future<Void> shutdown()
   {
-    int colonIndex = key.lastIndexOf(':');
-    if (colonIndex > 0) return key.substring(0, colonIndex);
-    return null;
+    if (isShutdown)
+    {
+      return Future.succeededFuture();
+    }
+
+    isShutdown = true;
+
+    if (cleanupTimerId != -1)
+    {
+      vertx.cancelTimer(cleanupTimerId);
+    }
+
+    if (drainageTimerId != -1)
+    {
+      vertx.cancelTimer(drainageTimerId);
+    }
+
+    return vertx.executeBlocking(() ->
+    {
+      LOGGER.info("Shutting down NatsConsumerPoolManager...");
+
+      // Close all consumers
+      pool.forEach((key, pooled) -> {
+        closeConsumer(pooled.subscription, "shutdown");
+      });
+
+      pool.clear();
+      workerExecutor.close();
+
+      LOGGER.info("NatsConsumerPoolManager shutdown complete - closed {} consumers",
+                  totalConsumersClosed.get());
+      return null;
+    }).mapEmpty();
+  }
+
+  // ===== INNER CLASSES =====
+
+  /**
+   * Pooled consumer wrapper with metadata
+   */
+  private static class PooledConsumer
+  {
+    final Subscription subscription;
+    final long generation;
+    final Instant created = Instant.now();
+    private volatile Instant lastUsed;
+
+    PooledConsumer(Subscription subscription, long generation)
+    {
+      this.subscription = subscription;
+      this.generation = generation;
+      this.lastUsed = created;
+    }
+
+    public long getCertificateGeneration()
+    {
+      return generation;
+    }
+
+    public Instant getLastUsed()
+    {
+      return lastUsed;
+    }
+
+    public void updateLastUsed()
+    {
+      this.lastUsed = Instant.now();
+    }
+
+    public boolean isValid(long currentGeneration)
+    {
+      return generation == currentGeneration;
+    }
+
+    public boolean isExpired(Instant now, Duration ttl)
+    {
+      return lastUsed.plus(ttl).isBefore(now);
+    }
   }
 
   /**
-   * Get registered consumers (for recreation)
+   * Descriptor for registered consumers (subject, consumerName, handler)
    */
-  public Map<String, ConsumerDescriptor> getRegisteredConsumers()
+  private static class ConsumerDescriptor
   {
-    return new HashMap<>(consumerRegistry);
+    final String subject;
+    final String consumerName;
+    final MessageHandler handler;
+
+    ConsumerDescriptor(String subject, String consumerName, MessageHandler handler)
+    {
+      this.subject = subject;
+      this.consumerName = consumerName;
+      this.handler = handler;
+    }
   }
 
-  private boolean isCertificateError(Exception e)
+  /**
+   * Consumer statistics for monitoring with migration support
+   */
+  public static class ConsumerStatistics
   {
-    if (e == null || e.getMessage() == null) return false;
-    String msg = e.getMessage().toLowerCase();
-    return msg.contains("certificate") || msg.contains("ssl") || msg.contains("tls") || msg.contains("handshake");
-  }
+    private final int poolSize;
+    private final int activeConsumers;
+    private final long totalPoolHits;
+    private final long totalPoolMisses;
+    private final long totalConsumersCreated;
+    private final long totalConsumersClosed;
+    private final long currentCertificateGeneration;
+    private final int activeOldGenerationConnections;
+    private final boolean migrationInProgress;
 
-  public void shutdown()
-  {
-    LOGGER.info("Shutting down consumer pool");
-    invalidateAllConsumers();
-    consumerRegistry.clear();
-    try { if (workerExecutor != null) workerExecutor.close(); } catch (Throwable t) { LOGGER.debug("Failed to close workerExecutor: {}", t.getMessage(), t); }
-  }
+    public ConsumerStatistics(int poolSize, int activeConsumers, long totalPoolHits,
+                             long totalPoolMisses, long totalConsumersCreated,
+                             long totalConsumersClosed, long currentCertificateGeneration,
+                             int activeOldGenerationConnections, boolean migrationInProgress)
+    {
+      this.poolSize = poolSize;
+      this.activeConsumers = activeConsumers;
+      this.totalPoolHits = totalPoolHits;
+      this.totalPoolMisses = totalPoolMisses;
+      this.totalConsumersCreated = totalConsumersCreated;
+      this.totalConsumersClosed = totalConsumersClosed;
+      this.currentCertificateGeneration = currentCertificateGeneration;
+      this.activeOldGenerationConnections = activeOldGenerationConnections;
+      this.migrationInProgress = migrationInProgress;
+    }
 
-  public long getCurrentGeneration()
-  {
-    return currentCertificateGeneration;
-  }
+    // Getters
+    public int getPoolSize() { return poolSize; }
+    public int getActiveConsumers() { return activeConsumers; }
+    public long getTotalPoolHits() { return totalPoolHits; }
+    public long getTotalPoolMisses() { return totalPoolMisses; }
+    public long getTotalConsumersCreated() { return totalConsumersCreated; }
+    public long getTotalConsumersClosed() { return totalConsumersClosed; }
+    public long getCurrentCertificateGeneration() { return currentCertificateGeneration; }
+    public int getActiveOldGenerationConnections() { return activeOldGenerationConnections; }
+    public boolean isMigrationInProgress() { return migrationInProgress; }
 
-//Monitoring method
- public int getActiveDrainOperationsCount()
- {
-   return activeDrainOperations.get();
- }
+    public double getHitRatio()
+    {
+      long total = totalPoolHits + totalPoolMisses;
+      return total > 0 ? (double)totalPoolHits / total : 0.0;
+    }
 
- public Map<String, Object> getPoolHealthStatus()
- {
-   Map<String, Object> health = new HashMap<>();
-   
-   health.put("currentGeneration", currentCertificateGeneration);
-   health.put("activeConsumers", consumerPool.size());
-   health.put("registeredConsumers", consumerRegistry.size());
-   health.put("drainingConsumers", drainingConsumers.size());
-   health.put("activeDrainOperations", activeDrainOperations.get());
-   
-   // Count consumers by generation
-   Map<Long, Integer> generationCounts = new HashMap<>();
-   for (ConsumerContext ctx : consumerPool.values())
-   {
-     generationCounts.merge(ctx.generation, 1, Integer::sum);
-   }
-   health.put("consumersByGeneration", generationCounts);
-   
-   return health;
- }
- 
-  public Map<String, Object> getPoolStats()
-  {
-    Map<String, Object> stats = new HashMap<>();
-    stats.put("currentGeneration", currentCertificateGeneration);
-    stats.put("activeConsumers", consumerPool.size());
-    stats.put("registeredConsumers", consumerRegistry.size());
-    return stats;
+    @Override
+    public String toString()
+    {
+      return String.format(
+        "ConsumerStats{pool=%d, active=%d, hits=%d, misses=%d, hit_ratio=%.2f%%, " +
+        "gen=%d, oldGen=%d, migrating=%s}",
+        poolSize, activeConsumers, totalPoolHits, totalPoolMisses, getHitRatio() * 100,
+        currentCertificateGeneration, activeOldGenerationConnections, migrationInProgress
+      );
+    }
   }
 }

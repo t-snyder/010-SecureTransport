@@ -42,7 +42,6 @@ public class ServiceBundle
 
   private static final String ServiceId        = "serviceId";
   private static final String Version          = "version";
-  private static final String KeyEpoch         = "keyEpoch";
   private static final String UpdateType       = "updateType";
   private static final String CreatedAt        = "createdAt";
   private static final String Status           = "status";
@@ -56,7 +55,6 @@ public class ServiceBundle
 
   private final String  serviceId;
   private final String  version;
-  private final long    keyEpoch;
   private final String  updateType;
   private final Instant createdAt;
   private final String  status;
@@ -66,17 +64,16 @@ public class ServiceBundle
   private final Map<String, Map<String, TopicKey>>   topicKeys;
   private final Map<String, TopicPermission>         topicPermissions;
 
-  public ServiceBundle( String serviceId, String version, long keyEpoch, String updateType, Instant createdAt, String status )
+  public ServiceBundle( String serviceId, String version, String updateType, Instant createdAt, String status )
   {
-    this( serviceId, version, keyEpoch, updateType, createdAt, status, new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>() );
+    this( serviceId, version, updateType, createdAt, status, new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>() );
   }
 
-  public ServiceBundle( String serviceId, String version, long keyEpoch, String updateType, Instant createdAt, String status, Map<Long, DilithiumKey> signingKeys, Map<String, Map<Long, DilithiumKey>> verifyKeys,
+  public ServiceBundle( String serviceId, String version, String updateType, Instant createdAt, String status, Map<Long, DilithiumKey> signingKeys, Map<String, Map<Long, DilithiumKey>> verifyKeys,
       Map<String, Map<String, TopicKey>> topicKeys, Map<String, TopicPermission> topicPermissions )
   {
     this.serviceId  = Objects.requireNonNull( serviceId,  "serviceId" );
     this.version    = Objects.requireNonNull( version,    "version" );
-    this.keyEpoch   = keyEpoch;
     this.updateType = Objects.requireNonNull( updateType, "updateType" );
     this.createdAt  = Objects.requireNonNull( createdAt,  "createdAt" );
     this.status     = Objects.requireNonNull( status,     "status" );
@@ -114,7 +111,6 @@ public class ServiceBundle
   // Getters
   public String  getServiceId()  { return serviceId;  }
   public String  getVersion()    { return version;    }
-  public long    getKeyEpoch()   { return keyEpoch;   }
   public String  getUpdateType() { return updateType; }
   public Instant getCreatedAt()  { return createdAt;  }
   public String  getStatus()     { return status;     }
@@ -153,7 +149,6 @@ public class ServiceBundle
 
       rec.put( ServiceId,  new Utf8( sb.getServiceId() ) );
       rec.put( Version,    new Utf8( sb.getVersion() ) );
-      rec.put( KeyEpoch,   sb.getKeyEpoch()  );
       rec.put( UpdateType, new Utf8( sb.getUpdateType() ) );
       rec.put( CreatedAt,  new Utf8( sb.getCreatedAt().toString() ) );
       rec.put( Status,     new Utf8( sb.getStatus() ) );
@@ -250,7 +245,6 @@ public class ServiceBundle
 
           String serviceId  = avroUtil.getString( rec, ServiceId );
           String version    = avroUtil.getString( rec, Version );
-          long   keyEpoch   = avroUtil.getLong(   rec, KeyEpoch );
           String updateType = avroUtil.getString( rec, UpdateType );
           String createdStr = avroUtil.getString( rec, CreatedAt );
           String status     = avroUtil.getString( rec, Status );
@@ -338,7 +332,7 @@ public class ServiceBundle
             }
           }
 
-          out = new ServiceBundle( serviceId, version, keyEpoch, updateType, createdAt, status, signingKeys, verifyKeys, topicKeys, topicPermissions );
+          out = new ServiceBundle( serviceId, version, updateType, createdAt, status, signingKeys, verifyKeys, topicKeys, topicPermissions );
         } 
         catch( EOFException eof )
         {
