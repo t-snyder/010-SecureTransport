@@ -198,8 +198,8 @@ public class MetadataServiceVert extends AbstractVerticle
         Future<String>          keyExchangeFuture = deployVerticle( keyExchangeVert, workerOptions, "KeyExchangeVert");
 
         // Deploy MetadataClientConsumerVert
-        MetadataClientConsumerVert mdConsumerVert = new MetadataClientConsumerVert( natsTlsClient );
-        Future<String> mdConsumerFuture = deployVerticle(mdConsumerVert, workerOptions, "MetadataClientConsumerVert");
+//        MetadataClientConsumerVert mdConsumerVert = new MetadataClientConsumerVert( natsTlsClient );
+//        Future<String> mdConsumerFuture = deployVerticle(mdConsumerVert, workerOptions, "MetadataClientConsumerVert");
 
         // Deploy VaultAppRoleSecretRotationVert
         String appRoleSecretName  = ( config.getVault().getAppRoleSecretName()  == null ) ? AppRoleSecretName  : config.getVault().getAppRoleSecretName();
@@ -223,7 +223,7 @@ public class MetadataServiceVert extends AbstractVerticle
        
         // Wait for all deployments to complete
         return Future.all( keyExchangeFuture,
-                           mdConsumerFuture,
+//                           mdConsumerFuture,
                            secretRotationFuture,
                            aclWatcherFuture,
                            caVertFuture

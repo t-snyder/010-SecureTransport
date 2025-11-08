@@ -2,7 +2,6 @@ package core.handler;
 
 
 import io.vertx.core.Future;
-//import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 
 import java.security.KeyPair;
@@ -19,9 +18,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
 import java.util.concurrent.ConcurrentHashMap;
-//import java.util.concurrent.atomic.AtomicBoolean;
-//import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -32,6 +30,7 @@ import core.model.ServiceBundle;
 import core.model.SharedSecretInfo;
 import core.model.service.TopicKey;
 import core.model.service.TopicPermission;
+import core.utils.KeyEpochUtil;
 
 /**
  * Complete unified key manager for all key types: - Shared secrets for
@@ -43,7 +42,8 @@ import core.model.service.TopicPermission;
 public class KeySecretManager
 {
   private static final Logger   LOGGER = LoggerFactory.getLogger(KeySecretManager.class.getName());
-  private static final Duration KEY_CLEANUP_GRACE_PERIOD = Duration.ofMinutes(60);
+  private static final Duration KEY_CLEANUP_GRACE_PERIOD   = Duration.ofMinutes(60);
+  private static final int      TOPIC_KEY_RETENTION_EPOCHS = 20;  // Keep 20 epochs (100 minutes)
 
   private final Vertx vertx;
 
@@ -58,9 +58,12 @@ public class KeySecretManager
   private final ConcurrentHashMap<Long, DilithiumKey> signingKeys; // {keyId -> key}
   
   private final Map<String, Long>  cacheRefreshTimes; // When each service's keys were last refreshed
-//  private final VaultAccessHandler vaultHandler;
+  private final VaultAccessHandler vaultHandler;
 
   private Map<String, KeyPair> kyberKeyPair = new HashMap<String, KeyPair>();; // In process key exchange
+
+  // Track which epochs we've loaded from key exchange or directly from Vault 
+  private final ConcurrentHashMap<Long, ServiceBundle> loadedServiceBundleEpochs = new ConcurrentHashMap<>();
 
   /**
    * Creates a new KeySecretManager with unified key storage
@@ -72,13 +75,14 @@ public class KeySecretManager
    */
   public KeySecretManager( Vertx vertx, VaultAccessHandler vaultHandler )
   {
-    this.vertx = vertx;
+    this.vertx        = vertx;
+    this.vaultHandler = vaultHandler;
+    
     this.sharedSecrets     = new ConcurrentHashMap<>();
     this.verifyKeys        = new ConcurrentHashMap<>();
     this.signingKeys       = new ConcurrentHashMap<>();
     this.topicKeys         = new ConcurrentHashMap<>();
     this.cacheRefreshTimes = new ConcurrentHashMap<>();
-//    this.vaultHandler      = vaultHandler;
 
     // Set up periodic cleanup of expired keys (all types)
     this.vertx.setPeriodic( 300000, id -> cleanupExpiredKeys() );
@@ -89,6 +93,7 @@ public class KeySecretManager
   /**
    * Load all keys and permissions from a ServiceBundle into the KeySecretManager.
    * This includes: signingKeys, verifyKeys, topicKeys, and topicPermissions.
+   * Also marks loaded epochs into loadedServiceBundleEpochs for the corresponding services.
    */
   public void loadFromServiceBundle( ServiceBundle bundle )
   {
@@ -97,7 +102,8 @@ public class KeySecretManager
     {
       for( Map.Entry<Long, DilithiumKey> entry : bundle.getSigningKeys().entrySet() )
       {
-        this.addSigningKeyToCache( entry.getValue() );
+        DilithiumKey dKey = entry.getValue();
+        addSigningKeyToCache( dKey );
       }
       LOGGER.debug( "Loaded {} signing keys from ServiceBundle", bundle.getSigningKeys().size() );
     }
@@ -148,7 +154,48 @@ public class KeySecretManager
       }
       LOGGER.debug( "Loaded {} topic permissions from ServiceBundle", bundle.getTopicPermissions().size() );
     }
+    
+    // mark the explicit (service, epoch) we requested
+    loadedServiceBundleEpochs.put( bundle.getKeyEpoch(), bundle );
   }
+ 
+  /**
+   *Check if we have a specific epoch loaded for a service
+   */
+  public boolean hasServiceBundleForEpoch( long epoch ) 
+  {
+    return loadedServiceBundleEpochs.contains(epoch);
+  }
+  
+  /**
+   * Load a specific ServiceBundle epoch from Vault on-demand
+   */
+  public Future<Void> loadServiceBundleForEpoch(String targetServiceId, long epoch)
+  {
+    // Check if already loaded
+    if (hasServiceBundleForEpoch( epoch ))
+    {
+      LOGGER.debug("ServiceBundle for epoch {} already loaded", epoch );
+      return Future.succeededFuture();
+    }
+
+    LOGGER.info("Fetching ServiceBundle from Vault: service='{}', epoch={}", targetServiceId, epoch);
+
+    return vaultHandler.getServiceBundle( targetServiceId, epoch )
+      .compose( bundle -> 
+       {  // Use compose instead of onSuccess
+         loadFromServiceBundle(bundle);
+
+         LOGGER.info("✅ Loaded ServiceBundle from Vault: service='{}', epoch={}", targetServiceId, epoch);
+         return Future.<Void>succeededFuture();
+       })
+      .recover( err -> 
+       {
+         LOGGER.error("Failed to load ServiceBundle from Vault: service='{}', epoch={}, error={}",
+                      targetServiceId, epoch, err.getMessage(), err);
+         return Future.failedFuture(err);
+       });
+  }  
   
   // ========================================================================
   // SHARED SECRET MANAGEMENT (EXISTING - COMPLETE)
@@ -214,7 +261,8 @@ public class KeySecretManager
       cleanupExpiredSharedSecrets( keyInfo.getSourceSvcId() );
 
       LOGGER.debug( "SharedSecretInfo stored in memory for service: {}", keyInfo.getSourceSvcId() );
-    } catch( Exception e )
+    } 
+    catch( Exception e )
     {
       LOGGER.error( "Error storing SharedSecretInfo. Error = " + e.getMessage() );
     }
@@ -403,15 +451,17 @@ public class KeySecretManager
       DilithiumKey key = serviceSigningKeys.get( epoch );
       if( key != null )
       {
-        // Check if expired
+        /** Check if expired
         if( key.isExpired() )
         {
           // Remove expired key
           serviceSigningKeys.remove( epoch );
+
           LOGGER.info( "Removed expired Dilithium public key: {}/{}", serviceId, epoch );
           return Future.failedFuture( new IllegalArgumentException( "ServiceID / Key ID not found." ));
         }
-
+        */
+        
         LOGGER.debug( "Found key {}:{} in local cache", serviceId, epoch );
         return Future.succeededFuture( key );
       }
@@ -474,7 +524,7 @@ public class KeySecretManager
 
     topicKeyMap.put( keyId, key );
 
-    // Cleanup old keys for this topic
+    // Cleanup old keys for this topic using epoch retention
     cleanupExpiredTopicKeys( topicName );
 
     LOGGER.debug( "Stored topic encryption key: {} for topic: {} (expires: {})", keyId, topicName, key.getExpiryTime() );
@@ -496,17 +546,9 @@ public class KeySecretManager
       return null;
     }
 
-    TopicKey key = topicKeyMap.get( keyId );
-
-    // Check if key is expired and remove if so
-    if( key != null && key.isExpired() )
-    {
-      LOGGER.warn( "Retrieved expired topic key: {} for topic: {}", keyId, topicName );
-      topicKeyMap.remove( keyId );
-      return null;
-    }
-
-    return key;
+    // Return the key directly. Do not remove it here based on expiry timestamp;
+    // cleanup is now governed by epoch retention policy.
+    return topicKeyMap.get( keyId );
   }
 
   /**
@@ -533,7 +575,9 @@ public class KeySecretManager
    */
   public Collection<TopicKey> getValidTopicKeys( String topicName )
   {
-    return getAllTopicKeys( topicName ).stream().filter( key -> !key.isExpired() ).collect( Collectors.toList() );
+    return getAllTopicKeys( topicName ).stream()
+                                       .filter( key -> !key.isExpired() )
+                                       .collect( Collectors.toList() );
   }
 
   /**
@@ -586,7 +630,6 @@ public class KeySecretManager
 
   /**
    * Remove a specific topic encryption key
-   */
   public boolean removeTopicKey( String topicName, String keyId )
   {
     if( topicName == null || keyId == null )
@@ -611,10 +654,10 @@ public class KeySecretManager
 
     return false;
   }
+   */
 
   /**
    * Remove all keys for a topic
-   */
   public int removeAllTopicKeys( String topicName )
   {
     if( topicName == null )
@@ -636,6 +679,7 @@ public class KeySecretManager
     LOGGER.info( "Removed {} topic encryption keys for topic: {}", count, topicName );
     return count;
   }
+   */
 
   /**
    * Get all topics that have stored keys
@@ -647,39 +691,34 @@ public class KeySecretManager
 
   /**
    * Cleanup expired topic keys for a specific topic
+   * Uses epoch retention: keep only keys with epoch >= newestEpoch - TOPIC_KEY_RETENTION_EPOCHS.
+   * Keys with epoch < cutoffEpoch will be removed. Also removes cleaned epochs from loadedServiceBundleEpochs.
    */
-  public void cleanupExpiredTopicKeys( String topicName )
+  private void cleanupExpiredTopicKeys( String topicName )
   {
+    long currentEpoch = KeyEpochUtil.epochNumberForInstant( Instant.now() );
+    long cutoffEpoch  = currentEpoch - TOPIC_KEY_RETENTION_EPOCHS;
+
     ConcurrentHashMap<String, TopicKey> topicKeyMap = topicKeys.get( topicName );
-    if( topicKeyMap == null )
+    if( topicKeyMap == null || topicKeyMap.isEmpty() )
     {
       return;
     }
 
-    Instant now = Instant.now();
-    Instant cutoff = now.minus( KEY_CLEANUP_GRACE_PERIOD );
-
     Iterator<Map.Entry<String, TopicKey>> iter = topicKeyMap.entrySet().iterator();
-    int removedCount = 0;
 
     while( iter.hasNext() )
     {
       Map.Entry<String, TopicKey> entry = iter.next();
       TopicKey key = entry.getValue();
 
-      if( key.getExpiryTime().isBefore( cutoff ) )
+      if( key.getEpochNumber() < cutoffEpoch )
       {
         key.clearKeyData(); // Clear sensitive data
         iter.remove();
-        removedCount++;
-
-        LOGGER.debug( "Removed expired topic key: {} for topic: {} (expired: {})", key.getKeyId(), topicName, key.getExpiryTime() );
+ 
+        LOGGER.debug( "Removed old topic key: {} for topic: {} (epoch: {}, cutoff: {})", key.getKeyId(), topicName, key.getEpochNumber(), cutoffEpoch );
       }
-    }
-
-    if( removedCount > 0 )
-    {
-      LOGGER.info( "Cleaned up {} expired topic keys for topic: {}", removedCount, topicName );
     }
 
     // Remove empty topic map
@@ -708,10 +747,22 @@ public class KeySecretManager
 
     // Cleanup topic encryption keys
     cleanupAllExpiredTopicKeys();
+    
+    long currentEpoch = KeyEpochUtil.epochNumberForInstant( Instant.now() );
+    long cutoffEpoch  = currentEpoch - TOPIC_KEY_RETENTION_EPOCHS;
+ 
+    loadedServiceBundleEpochs.forEach((key, value) -> 
+    {
+      if( key < cutoffEpoch )
+      {
+        loadedServiceBundleEpochs.remove( key );
+      }
+    });
   }
 
   /**
    * Cleanup expired topic keys for all topics
+   * Delegates to per-topic cleanup (epoch-retention based).
    */
   private void cleanupAllExpiredTopicKeys()
   {
@@ -734,23 +785,34 @@ public class KeySecretManager
 
   /**
    * Cleanup expired Dilithium verify keys
+   * Now uses retention by epoch: for each service, determine newest epoch and
+   * remove keys with epoch < (newestEpoch - TOPIC_KEY_RETENTION_EPOCHS).
+   * Also ensures loadedServiceBundleEpochs is unmarked for removed epochs.
    */
   private void cleanupExpiredDilithiumKeys()
   {
+    long currentEpoch = KeyEpochUtil.epochNumberForInstant( Instant.now() );
+    long cutoffEpoch  = currentEpoch - TOPIC_KEY_RETENTION_EPOCHS;
+    
     for( Map.Entry<String, ConcurrentHashMap<Long, DilithiumKey>> serviceEntry : verifyKeys.entrySet() )
     {
+      String serviceId = serviceEntry.getKey();
       Map<Long, DilithiumKey> serviceKeys = serviceEntry.getValue();
+      if( serviceKeys == null || serviceKeys.isEmpty() )
+        continue;
 
-      List<Long> expiredKeyIds = serviceKeys.entrySet().stream().filter( entry -> entry.getValue().isExpired() ).map( Map.Entry::getKey ).collect( Collectors.toList() );
+      List<Long> toRemove = serviceKeys.keySet().stream()
+                                       .filter(epoch -> epoch < cutoffEpoch)
+                                       .collect( Collectors.toList() );
 
-      if( !expiredKeyIds.isEmpty() )
+      if( !toRemove.isEmpty() )
       {
-        for( Long epoch : expiredKeyIds )
+        for( Long epoch : toRemove )
         {
           serviceKeys.remove( epoch );
         }
 
-        LOGGER.info( "Removed {} expired Dilithium keys for service {}", expiredKeyIds.size(), serviceEntry.getKey() );
+        LOGGER.info( "Removed {} old Dilithium keys for service {} (kept last {} epochs, newestEpoch={})", toRemove.size(), serviceEntry.getKey(), TOPIC_KEY_RETENTION_EPOCHS, currentEpoch );
       }
     }
   }
@@ -768,6 +830,7 @@ public class KeySecretManager
     signingKeys.clear();
     topicKeys.clear();
     cacheRefreshTimes.clear();
+    loadedServiceBundleEpochs.clear();
 
     LOGGER.info( "Cleared all secrets and cached keys (including topic encryption keys)" );
   }
@@ -813,4 +876,67 @@ public class KeySecretManager
       throw new IllegalArgumentException( "Expires time cannot be null" );
     }
   }
+
+  // ------------------------------------------------------------------------
+  // Helpers to maintain loadedServiceBundleEpochs in a concurrency-safe manner
+  // ------------------------------------------------------------------------
+
+  /**
+   * Mark that we've loaded a service bundle epoch for a given service.
+  private void markLoadedEpoch(String serviceId, long epoch)
+  {
+    if (serviceId == null || serviceId.isBlank() || epoch <= 0)
+      return;
+
+    Set<Long> set = loadedServiceBundleEpochs.computeIfAbsent(serviceId, k -> ConcurrentHashMap.newKeySet());
+    set.add(epoch);
+  }
+   */
+
+  /**
+   * Unmark (remove) an epoch for a specific service. If the set becomes empty
+   * the service entry is removed.
+  private void unmarkLoadedEpoch(String serviceId, long epoch)
+  {
+    if (serviceId == null || epoch <= 0)
+      return;
+
+    Set<Long> set = loadedServiceBundleEpochs.get(serviceId);
+    if (set != null)
+    {
+      set.remove(epoch);
+      if (set.isEmpty())
+      {
+        // conditional remove to avoid race
+        loadedServiceBundleEpochs.remove(serviceId, set);
+      }
+    }
+  }
+   */
+
+  /**
+   * Unmark (remove) an epoch from all services' sets. This is used when keys
+   * for a given epoch are cleaned by topic cleanup and we want loadedServiceBundleEpochs
+   * to reflect that.
+  private void unmarkLoadedEpochGlobally(long epoch)
+  {
+    if (epoch <= 0)
+      return;
+
+    // iterate over a snapshot to avoid concurrent modification surprises
+    for (Map.Entry<String, Set<Long>> entry : new ArrayList<>(loadedServiceBundleEpochs.entrySet()))
+    {
+      String svc = entry.getKey();
+      Set<Long> set = entry.getValue();
+      if (set != null && set.remove(epoch))
+      {
+        if (set.isEmpty())
+        {
+          loadedServiceBundleEpochs.remove(svc, set);
+        }
+      }
+    }
+  }
+   */
+  
 }

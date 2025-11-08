@@ -1,7 +1,6 @@
 #!/bin/bash
 # Deploy NATS JetStream with mTLS using manifests (no Helm, no Operator).
-# Refactored to render per-pod nats.conf at startup (probe TLS/TCP on 6222)
-# and use OrderedReady StatefulSet to avoid route churn.
+# Refactored to use PULL consumers for zero message loss during CA rotation
 set -euo pipefail
 
 # ---------- Config (override via env) ----------
@@ -433,8 +432,8 @@ run_nats_cmd "nats stream add KEY_EXCHANGE \
   --deny-purge \
   --defaults" || echo 'Stream KEY_EXCHANGE may already exist'
 
-echo "Creating stream METADATA_CLIENT..."
-run_nats_cmd "nats stream add METADATA_CLIENT \
+echo "Creating stream METADATA_CA_CLIENT..."
+run_nats_cmd "nats stream add METADATA_CA_CLIENT \
   --server=tls://${NATS_SERVICE}:4222 \
   --tlscert=/etc/nats-client-tls-certs/tls.crt \
   --tlskey=/etc/nats-client-tls-certs/tls.key \
@@ -448,41 +447,41 @@ run_nats_cmd "nats stream add METADATA_CLIENT \
   --no-allow-rollup \
   --deny-delete \
   --deny-purge \
-  --defaults" || echo 'Stream METADATA_CLIENT may already exist'
+  --defaults" || echo 'Stream METADATA_CA_CLIENT may already exist'
 
-echo "Creating stream METADATA_BUNDLE_PULL..."
-run_nats_cmd "nats stream add METADATA_BUNDLE_PULL \
-  --server=tls://${NATS_SERVICE}:4222 \
-  --tlscert=/etc/nats-client-tls-certs/tls.crt \
-  --tlskey=/etc/nats-client-tls-certs/tls.key \
-  --tlsca=/etc/nats-ca-certs/ca.crt \
-  --subjects='metadata.bundle-pull.>' \
-  --storage=file \
-  --retention=limits \
-  --discard=old \
-  --replicas=3 \
-  --max-age=2h \
-  --no-allow-rollup \
-  --deny-delete \
-  --deny-purge \
-  --defaults" || echo 'Stream METADATA_BUNDLE_PULL may already exist'
+#echo "Creating stream METADATA_SERVICE_BUNDLE..."
+#run_nats_cmd "nats stream add METADATA_SERVICE_BUNDLE \
+#  --server=tls://${NATS_SERVICE}:4222 \
+#  --tlscert=/etc/nats-client-tls-certs/tls.crt \
+#  --tlskey=/etc/nats-client-tls-certs/tls.key \
+#  --tlsca=/etc/nats-ca-certs/ca.crt \
+#  --subjects='metadata.service-bundle.>' \
+#  --storage=file \
+#  --retention=limits \
+#  --discard=old \
+#  --replicas=3 \
+#  --max-age=2h \
+#  --no-allow-rollup \
+#  --deny-delete \
+#  --deny-purge \
+#  --defaults" || echo 'Stream METADATA_SERVICE_BUNDLE may already exist'
 
-echo "Creating stream METADATA_BUNDLE_PUSH..."
-run_nats_cmd "nats stream add METADATA_BUNDLE_PUSH \
-  --server=tls://${NATS_SERVICE}:4222 \
-  --tlscert=/etc/nats-client-tls-certs/tls.crt \
-  --tlskey=/etc/nats-client-tls-certs/tls.key \
-  --tlsca=/etc/nats-ca-certs/ca.crt \
-  --subjects='metadata.bundle-push.>' \
-  --storage=file \
-  --retention=limits \
-  --discard=old \
-  --replicas=3 \
-  --max-age=6h \
-  --no-allow-rollup \
-  --deny-delete \
-  --deny-purge \
-  --defaults" || echo 'Stream METADATA_BUNDLE_PUSH may already exist'
+#echo "Creating stream METADATA_BUNDLE_PUSH..."
+#run_nats_cmd "nats stream add METADATA_BUNDLE_PUSH \
+#  --server=tls://${NATS_SERVICE}:4222 \
+#  --tlscert=/etc/nats-client-tls-certs/tls.crt \
+#  --tlskey=/etc/nats-client-tls-certs/tls.key \
+#  --tlsca=/etc/nats-ca-certs/ca.crt \
+#  --subjects='metadata.bundle-push.>' \
+#  --storage=file \
+#  --retention=limits \
+#  --discard=old \
+#  --replicas=3 \
+#  --max-age=6h \
+#  --no-allow-rollup \
+#  --deny-delete \
+#  --deny-purge \
+#  --defaults" || echo 'Stream METADATA_BUNDLE_PUSH may already exist'
 
 echo "Creating stream AUTH_STREAM..."
 run_nats_cmd "nats stream add AUTH_STREAM \
@@ -525,16 +524,15 @@ run_nats_cmd "nats stream list \
   --tlskey=/etc/nats-client-tls-certs/tls.key \
   --tlsca=/etc/nats-ca-certs/ca.crt" || true
 
-echo "=== Ensuring JetStream consumers (idempotent) ==="
+echo "=== Creating JetStream PULL consumers (idempotent) ==="
 
-# Helper function to add consumer with existence check
-add_consumer() {
+# Replace the add_pull_consumer function in Step-06 with this robust version
+add_pull_consumer() {
   local stream=$1
   local consumer=$2
-  local subject=$3
-  local group=$4
-  
-  echo "Push consumer ${consumer} on stream ${stream}..."
+  local filter_subject=$3
+
+  echo "Pull consumer ${consumer} on stream ${stream} (filter: ${filter_subject})..."
   run_nats_cmd "
     if nats consumer info ${stream} ${consumer} \
       --server=tls://${NATS_SERVICE}:4222 \
@@ -543,87 +541,81 @@ add_consumer() {
       --tlsca=/etc/nats-ca-certs/ca.crt >/dev/null 2>&1; then
       echo 'already exists'
     else
-      nats consumer add ${stream} ${consumer} \
-        --server=tls://${NATS_SERVICE}:4222 \
-        --tlscert=/etc/nats-client-tls-certs/tls.crt \
-        --tlskey=/etc/nats-client-tls-certs/tls.key \
-        --tlsca=/etc/nats-ca-certs/ca.crt \
-        --deliver=last \
-        --target='${subject}' \
-        --deliver-group='${group}' \
-        --ack=explicit \
-        --flow-control \
-        --heartbeat=2s \
-        --max-pending=200 \
-        --defaults && echo 'created' || echo 'create failed'
+      # Check if the installed nats CLI supports --max-ack-pending
+      if nats consumer add --help 2>&1 | grep -q -- '--max-ack-pending'; then
+        nats consumer add ${stream} ${consumer} \
+          --server=tls://${NATS_SERVICE}:4222 \
+          --tlscert=/etc/nats-client-tls-certs/tls.crt \
+          --tlskey=/etc/nats-client-tls-certs/tls.key \
+          --tlsca=/etc/nats-ca-certs/ca.crt \
+          --pull \
+          --ack=explicit \
+          --max-deliver=-1 \
+          --max-ack-pending=1000 \
+          --replay=instant \
+          --filter='${filter_subject}' \
+          --defaults && echo 'created' || echo 'create failed'
+      else
+        # Fallback for older nats CLI that doesn't understand --max-ack-pending
+        nats consumer add ${stream} ${consumer} \
+          --server=tls://${NATS_SERVICE}:4222 \
+          --tlscert=/etc/nats-client-tls-certs/tls.crt \
+          --tlskey=/etc/nats-client-tls-certs/tls.key \
+          --tlsca=/etc/nats-ca-certs/ca.crt \
+          --pull \
+          --ack=explicit \
+          --max-deliver=-1 \
+          --replay=instant \
+          --filter='${filter_subject}' \
+          --defaults && echo 'created' || echo 'create failed'
+      fi
     fi
   "
 }
 
-# METADATA_BUNDLE_PUSH consumers
-add_consumer "METADATA_BUNDLE_PUSH" "metadata-bundle-push-watcher" "deliver.metadata.bundle-push.svc-watcher" "metadata-bundle-push-watcher"
-add_consumer "METADATA_BUNDLE_PUSH" "metadata-bundle-push-tester" "deliver.metadata.bundle-push.svc-tester" "metadata-bundle-push-tester"
-add_consumer "METADATA_BUNDLE_PUSH" "metadata-bundle-push-authcontroller" "deliver.metadata.bundle-push.svc-authcontroller" "metadata-bundle-push-authcontroller"
-add_consumer "METADATA_BUNDLE_PUSH" "metadata-bundle-push-gatekeeper" "deliver.metadata.bundle-push.svc-gatekeeper" "metadata-bundle-push-gatekeeper"
+# KEY_EXCHANGE consumers (PULL based)
+#echo "=== KEY_EXCHANGE consumers ==="
+add_pull_consumer "KEY_EXCHANGE" "metadata-key-exchange-metadata"       "metadata.key-exchange.metadata"
+add_pull_consumer "KEY_EXCHANGE" "metadata-key-exchange-watcher"        "metadata.key-exchange.watcher"
+add_pull_consumer "KEY_EXCHANGE" "metadata-key-exchange-authcontroller" "metadata.key-exchange.authcontroller"
+add_pull_consumer "KEY_EXCHANGE" "metadata-key-exchange-gatekeeper"     "metadata.key-exchange.gatekeeper"
 
-# METADATA_BUNDLE_PULL consumers
-add_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-watcher" "deliver.metadata.bundle-pull.svc-watcher" "metadata-bundle-pull-watcher"
-add_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-metadata" "deliver.metadata.bundle-pull.svc-metadata" "metadata-bundle-pull-metadata"
-add_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-tester" "deliver.metadata.bundle-pull.svc-tester" "metadata-bundle-pull-tester"
-add_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-authcontroller" "deliver.metadata.bundle-pull.svc-authcontroller" "metadata-bundle-pull-authcontroller"
-add_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-gatekeeper" "deliver.metadata.bundle-pull.svc-gatekeeper" "metadata-bundle-pull-gatekeeper"
+# METADATA_BUNDLE_PUSH consumers (PULL based)
+#echo "=== METADATA_SERVICE_BUNDLE consumers ==="
+#add_pull_consumer "METADATA_SERVICE_BUNDLE" "metadata-service-bundle-watcher"        "metadata.service-bundle.svc-watcher"
+#add_pull_consumer "METADATA_SERVICE_BUNDLE" "metadata-service-bundle-tester"         "metadata.service-bundle.svc-tester"
+#add_pull_consumer "METADATA_SERVICE_BUNDLE" "metadata-service-bundle-authcontroller" "metadata.service-bundle.svc-authcontroller"
+#add_pull_consumer "METADATA_SERVICE_BUNDLE" "metadata-service-bundle-gatekeeper"     "metadata.service-bundle.svc-gatekeeper"
 
-# METADATA_CLIENT consumers
-# Create a per-service durable consumer for CA bundles so each service receives the CA update.
-# Each consumer targets a service-specific deliver subject:
-#   deliver.metadata.client.ca-cert.<service>
-# and uses a durable name <service>-ca-consumer.
-# Adjust CA_SERVICES list to match authorized services that should receive CA updates.
-CA_SERVICES=("watcher" "authcontroller" "gatekeeper")
+# METADATA_BUNDLE_PULL consumers (PULL based)
+#echo "=== METADATA_BUNDLE_PULL consumers ==="
+#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-watcher" "metadata.bundle-pull.svc-watcher"
+#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-metadata" "metadata.bundle-pull.svc-metadata"
+#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-tester" "metadata.bundle-pull.svc-tester"
+#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-authcontroller" "metadata.bundle-pull.svc-authcontroller"
+#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-gatekeeper" "metadata.bundle-pull.svc-gatekeeper"
 
-for svc in "${CA_SERVICES[@]}"; do
-  durable="${svc}-ca-consumer"
-  target="deliver.metadata.client.ca-cert.${svc}"
-  echo "Creating per-service CA consumer ${durable} (target=${target}) on METADATA_CLIENT..."
-  run_nats_cmd "
-    if nats consumer info METADATA_CLIENT ${durable} \
-      --server=tls://${NATS_SERVICE}:4222 \
-      --tlscert=/etc/nats-client-tls-certs/tls.crt \
-      --tlskey=/etc/nats-client-tls-certs/tls.key \
-      --tlsca=/etc/nats-ca-certs/ca.crt >/dev/null 2>&1; then
-      echo 'already exists'
-    else
-      nats consumer add METADATA_CLIENT ${durable} \
-        --server=tls://${NATS_SERVICE}:4222 \
-        --tlscert=/etc/nats-client-tls-certs/tls.crt \
-        --tlskey=/etc/nats-client-tls-certs/tls.key \
-        --tlsca=/etc/nats-ca-certs/ca.crt \
-        --deliver=last \
-        --target='${target}' \
-        --ack=explicit \
-        --flow-control \
-        --heartbeat=2s \
-        --max-pending=200 \
-        --defaults && echo 'created' || echo 'create failed'
-    fi
-  "
-done
+# METADATA_CA_CLIENT consumers (PULL based)
+echo "=== METADATA_CLIENT consumers ==="
+#add_pull_consumer "METADATA_CA_CLIENT" "metadata-client-ca-cert" "metadata.client.ca-cert"
+add_pull_consumer "METADATA_CA_CLIENT" "authcontroller-ca-consumer" "metadata.client.ca-cert"
+add_pull_consumer "METADATA_CA_CLIENT" "gatekeeper-ca-consumer" "metadata.client.ca-cert"
+add_pull_consumer "METADATA_CA_CLIENT" "watcher-ca-consumer" "metadata.client.ca-cert"
 
-# Keep request consumer used for RPC-like requests
-add_consumer "METADATA_CLIENT" "metadata-client-requests" "deliver.metadata.client.request" "metadata-client-requests"
+# AUTH_STREAM consumers (PULL based)
+echo "=== AUTH_STREAM consumers ==="
+add_pull_consumer "AUTH_STREAM" "auth-requests" "auth.auth-request"
+add_pull_consumer "AUTH_STREAM" "auth-tester-consumer" "auth.tester.consumer"
 
-# AUTH_STREAM consumers
-add_consumer "AUTH_STREAM" "auth-requests" "deliver.auth.auth-request" "auth-requests"
-add_consumer "AUTH_STREAM" "auth-tester-consumer" "deliver.auth.tester.consumer" "auth-tester-consumer"
-
-# GATEKEEPER_STREAM consumers
-add_consumer "GATEKEEPER_STREAM" "gatekeeper-responder-consumer" "deliver.gatekeeper.responder" "gatekeeper-responder"
+# GATEKEEPER_STREAM consumers (PULL based)
+echo "=== GATEKEEPER_STREAM consumers ==="
+add_pull_consumer "GATEKEEPER_STREAM" "gatekeeper-responder-consumer" "gatekeeper.responder"
 
 echo "=== Consumer creation complete ==="
 
 # List all consumers for verification
 echo "=== Listing all consumers ==="
-for stream in METADATA_BUNDLE_PUSH METADATA_BUNDLE_PULL METADATA_CLIENT AUTH_STREAM GATEKEEPER_STREAM; do
+for stream in KEY_EXCHANGE METADATA_CA_CLIENT AUTH_STREAM GATEKEEPER_STREAM; do
   echo "Consumers for stream ${stream}:"
   run_nats_cmd "nats consumer list ${stream} \
     --server=tls://${NATS_SERVICE}:4222 \
@@ -639,9 +631,34 @@ kubectl --context="${CLUSTER}" delete pod -n "${NATS_NAMESPACE}" nats-client --i
 # cleanup tmp dir
 rm -rf "${TMP_CA_DIR}"
 
-echo "STEP-06 completed: NATS deployed (StatefulSet w/ dynamic per-pod config), JetStream streams created (idempotent)."
+echo ""
+echo "=========================================================================="
+echo "STEP-06 completed: NATS deployed with PULL consumers"
+echo "=========================================================================="
+echo ""
+echo "Key changes from push consumers:"
+echo "  • All consumers are now PULL-based with explicit ack"
+echo "  • No deliver subjects or queue groups (server-side only)"
+echo "  • Consumers use --filter to select specific subjects"
+echo "  • max-ack-pending=1000 for backpressure control"
+echo "  • replay=instant for immediate delivery"
+echo "  • max-deliver=-1 for unlimited redelivery on nak"
+echo ""
+echo "Client code must now:"
+echo "  1. Bind to durable consumer by name"
+echo "  2. Use pull-based fetch (e.g., sub.pull(batch_size))"
+echo "  3. Explicitly ack each message after processing"
+echo "  4. Handle nak for failures to trigger redelivery"
+echo ""
+echo "Benefits:"
+echo "  ✓ Zero message loss during CA rotation"
+echo "  ✓ No duplicate delivery on reconnection"
+echo "  ✓ Explicit backpressure control"
+echo "  ✓ Server maintains exact ack state"
+echo ""
 echo "Manual: port-forward if you need to access NATS locally:"
 echo "/bin/bash $PROTODIR/scripts/Helpers/Nats-portforward.sh"
+echo ""
 read -p "Press Enter to finish..."
 
 exit 0

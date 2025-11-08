@@ -59,7 +59,9 @@ public class SignedMessage implements Serializable
 
   // Avro field names
   private static final String MESSAGE_ID        = "messageId";
-  private static final String MESSAGE_TYPE      = "messageType";    
+  private static final String MESSAGE_TYPE      = "messageType"; 
+  private static final String CA_EPOCH          = "caEpoch";
+  private static final String KEY_EPOCH         = "keyEpoch";
   private static final String SIGNER_SERVICE_ID = "signerServiceId";
   private static final String SIGNER_KEY_ID     = "signerKeyId";
   private static final String TIMESTAMP         = "timestamp";
@@ -75,6 +77,8 @@ public class SignedMessage implements Serializable
   // Message fields
   private String  messageId;
   private String  messageType;
+  private Long    caEpoch;
+  private Long    keyEpoch;
   private String  signerServiceId;
   private Long    signerKeyId;
   private Instant timestamp;
@@ -87,11 +91,13 @@ public class SignedMessage implements Serializable
   /**
    * Create a signed message
    */
-  public SignedMessage( String messageId, String messageType, String signerServiceId, Long signerKeyId, Instant timestamp, 
+  public SignedMessage( String messageId, String messageType, long caEpoch, long keyEpoch, String signerServiceId, Long signerKeyId, Instant timestamp, 
                         byte[] signature, String topicName,   String encryptKeyId, String payloadType,  byte[] payload )
   {
     this.messageId       = messageId;
     this.messageType     = messageType;
+    this.caEpoch         = caEpoch;
+    this.keyEpoch        = keyEpoch;
     this.signerServiceId = signerServiceId;
     this.signerKeyId     = signerKeyId;
     this.timestamp       = timestamp;
@@ -105,6 +111,8 @@ public class SignedMessage implements Serializable
   // Getters
   public String  getMessageId()       { return messageId;       }
   public String  getMessageType()     { return messageType;     }
+  public Long    getCaEpoch()         { return caEpoch;         }
+  public Long    getKeyEpoch()        { return keyEpoch;        }
   public String  getSignerServiceId() { return signerServiceId; }
   public Long    getSignerKeyId()     { return signerKeyId;     }
   public Instant getTimestamp()       { return timestamp;       }
@@ -114,13 +122,6 @@ public class SignedMessage implements Serializable
   public String  getPayloadType()     { return payloadType;     }
   public byte[]  getPayload()         { return payload;         }
 
-  /**
-   * Extract the signature information in format "keyId:base64signature"
-  public String getSignatureWithKeyId()
-  {
-    return signerKeyId + ":" + signature;
-  }
-   */
 
   /**
    * Serialize using Avro binary format
@@ -145,16 +146,19 @@ public class SignedMessage implements Serializable
       GenericDatumWriter<GenericRecord> writer = new GenericDatumWriter<>( msgSchema );
       GenericRecord record = new GenericData.Record( msgSchema );
 
-      record.put( MESSAGE_ID,        new Utf8( msgObj.getMessageId()       ));
-      record.put( MESSAGE_TYPE,      new Utf8( msgObj.getMessageType()     ));
-      record.put( SIGNER_SERVICE_ID, new Utf8( msgObj.getSignerServiceId() ));
-      record.put( SIGNER_KEY_ID,     msgObj.getSignerKeyId()     );
-      record.put( TIMESTAMP,         new Utf8( msgObj.getTimestamp().toString() ));
-      record.put( SIGNATURE,         ByteBuffer.wrap( msgObj.getSignature()     ));
-      record.put( TOPIC_NAME    ,    new Utf8( msgObj.getTopicName()        ));
-      record.put( ENCRYPT_KEY_ID,    new Utf8( msgObj.getEncryptKeyId()    ));
-      record.put( PAYLOAD_TYPE,      new Utf8( msgObj.getPayload()  ));
-      record.put( PAYLOAD,           ByteBuffer.wrap( msgObj.getPayload()  ));
+      // Required / expected fields (null-safe)
+      if (msgObj.getMessageId()       != null) record.put( MESSAGE_ID,        new Utf8( msgObj.getMessageId() ));
+      if (msgObj.getMessageType()     != null) record.put( MESSAGE_TYPE,      new Utf8( msgObj.getMessageType() ));
+      if (msgObj.getCaEpoch()         != null) record.put( CA_EPOCH,          msgObj.getCaEpoch() );
+      if (msgObj.getKeyEpoch()        != null) record.put( KEY_EPOCH,         msgObj.getKeyEpoch() );
+      if (msgObj.getSignerServiceId() != null) record.put( SIGNER_SERVICE_ID, new Utf8( msgObj.getSignerServiceId() ));
+      if (msgObj.getSignerKeyId()     != null) record.put( SIGNER_KEY_ID,     msgObj.getSignerKeyId() );
+      if (msgObj.getTimestamp()       != null) record.put( TIMESTAMP,         new Utf8( msgObj.getTimestamp().toString() ));
+      if (msgObj.getSignature()       != null) record.put( SIGNATURE,         ByteBuffer.wrap( msgObj.getSignature() ));
+      if (msgObj.getTopicName()       != null) record.put( TOPIC_NAME,        new Utf8( msgObj.getTopicName() ));
+      if (msgObj.getEncryptKeyId()    != null) record.put( ENCRYPT_KEY_ID,    new Utf8( msgObj.getEncryptKeyId() ));
+      if (msgObj.getPayloadType()     != null) record.put( PAYLOAD_TYPE,      new Utf8( msgObj.getPayloadType() ));
+      if (msgObj.getPayload()         != null) record.put( PAYLOAD,           ByteBuffer.wrap( msgObj.getPayload() ));
 
       writer.write( record, encoder );
       encoder.flush();
@@ -172,7 +176,7 @@ public class SignedMessage implements Serializable
   /**
    * Deserialize from Avro binary format
    */
-  public static SignedMessage deserialize( byte[] bytes ) throws Exception
+  public static SignedMessage deSerialize( byte[] bytes ) throws Exception
   {
     LOGGER.debug( "SignedMessage.deserialize starting." );
 
@@ -201,6 +205,8 @@ public class SignedMessage implements Serializable
 
           String messageId       = avroUtil.getString(    record, MESSAGE_ID );
           String messageType     = avroUtil.getString(    record, MESSAGE_TYPE );
+          Long   caEpoch         = avroUtil.getLong(      record, CA_EPOCH );
+          Long   keyEpoch        = avroUtil.getLong(      record, KEY_EPOCH  );
           String signerServiceId = avroUtil.getString(    record, SIGNER_SERVICE_ID );
           Long   signerKeyId     = avroUtil.getLong(      record, SIGNER_KEY_ID );
           String timestampStr    = avroUtil.getString(    record, TIMESTAMP );
@@ -212,7 +218,7 @@ public class SignedMessage implements Serializable
 
           Instant timestamp      = Instant.from(ISO_INSTANT_FORMATTER.parse( timestampStr ));
 
-          result = new SignedMessage( messageId, messageType, signerServiceId, signerKeyId,
+          result = new SignedMessage( messageId, messageType, caEpoch, keyEpoch, signerServiceId, signerKeyId,
                                       timestamp, signature,   topicName, encryptKeyId,   payloadType,  payload );
         } 
         catch( EOFException eof )

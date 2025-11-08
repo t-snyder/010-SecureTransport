@@ -6,7 +6,6 @@ import io.vertx.core.WorkerExecutor;
 import io.vertx.core.Promise;
 import io.vertx.core.CompositeFuture;
 import io.vertx.core.json.JsonObject;
-import io.vertx.ext.web.codec.BodyCodec;
 import io.vertx.core.json.JsonArray;
 
 import java.io.ByteArrayInputStream;
@@ -18,7 +17,6 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
