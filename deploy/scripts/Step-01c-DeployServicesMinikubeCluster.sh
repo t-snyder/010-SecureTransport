@@ -87,7 +87,5 @@ helm install cert-manager jetstack/cert-manager \
   --set extraArgs[0]="--feature-gates=ExperimentalGatewayAPISupport=true" \
   --set config.enableGatewayAPI=true
   
-# Create metadata namespace within services cluster
-kubectl --context=$CLUSTER create namespace metadata
-  
+ 
 

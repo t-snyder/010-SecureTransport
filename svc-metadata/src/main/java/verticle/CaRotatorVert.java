@@ -6,8 +6,7 @@ import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.vertx.core.*;
 import io.vertx.core.buffer.Buffer;
-
-//import io.nats.client.Message;
+import io.vertx.core.json.JsonObject;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,82 +28,70 @@ import handler.MetadataVaultHandler;
 import helper.MetadataConfig;
 
 import java.nio.charset.StandardCharsets;
-//import java.nio.file.Files;
-//import java.nio.file.Path;
-//import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
-import java.util.Base64;
-//import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * CaRotatorVert - Enhanced CA bundle rotation with NATS JetStream support
+ * Enhanced CA Rotator with issuer cleanup and reliable issuer detection
  */
 public class CaRotatorVert extends AbstractVerticle
 {
-  private static final Logger LOGGER = LoggerFactory.getLogger( CaRotatorVert.class );
+  private static final Logger LOGGER = LoggerFactory.getLogger(CaRotatorVert.class);
 
   private static final String VAULT_ROOT_CA_PATH = "pki";
-  private static final String NATS_PKI_MOUNT = "nats_int";  // Changed from pulsar_int
+  private static final String NATS_PKI_MOUNT = "nats_int";
 
   private static final String CERT_TYPE = "rsa";
-  private static final int    CERT_STRENGTH = 4096;
+  private static final int CERT_STRENGTH = 4096;
 
-  // Local metadata service secret (this service's namespace)
-  private static final String LOCAL_CA_SECRET_NAME = "nats-ca-secret";  // Changed from pulsar-ca-secret
+  private static final String LOCAL_CA_SECRET_NAME = "nats-ca-secret";
   private static final String LOCAL_CA_SECRET_KEY = "ca.crt";
 
-  // PEM certificate validation patterns
   private static final Pattern PEM_CERT_PATTERN = Pattern.compile(
     "-----BEGIN CERTIFICATE-----[\\s\\S]*?-----END CERTIFICATE-----"
   );
-  private static final Pattern BASE64_PATTERN = Pattern.compile("^[A-Za-z0-9+/]*={0,2}$");
 
-  private KubernetesClient       kubeClient;
-  private NatsTLSClient          natsTLSClient;  // Changed from PulsarTLSClient
-  private WorkerExecutor         workerExecutor;
-  private MetadataVaultHandler   metadataVaultHandler;
+  private KubernetesClient kubeClient;
+  private NatsTLSClient natsTLSClient;
+  private WorkerExecutor workerExecutor;
+  private MetadataVaultHandler metadataVaultHandler;
 
-  private final MetadataConfig   config;
+  private final MetadataConfig config;
   private final DilithiumService signer;
   private final KeySecretManager keyCache;
-  private final AesGcmHkdfCrypto aesCrypto   = new AesGcmHkdfCrypto();
-  private final CAEpochUtil      caEpochUtil = new CAEpochUtil();
+  private final AesGcmHkdfCrypto aesCrypto = new AesGcmHkdfCrypto();
+  private final CAEpochUtil caEpochUtil = new CAEpochUtil();
 
   private String namespace;
-  private long   timerId = -1;
-
-  // startup timer id (one-shot) used to delay initial rotation
-  private long    startupTimerId = -1;
+  private long timerId = -1;
+  private long startupTimerId = -1;
   private Instant startupInstant;
 
-  // Minimum delay before the first rotation check (default 3 minutes).
   private static final Duration INITIAL_ROTATION_DELAY = Duration.ofMinutes(3);
+  private static final long     initialDelayMs         = INITIAL_ROTATION_DELAY.toMillis();
 
-  // Track last epoch that we've performed a rotation for so we don't run twice for the same epoch.
   private volatile long lastRotatedEpoch = Long.MIN_VALUE;
 
-  // Enhanced retry configuration
   private static final int MAX_ROTATION_RETRIES = 3;
   private static final Duration ROTATION_RETRY_DELAY = Duration.ofSeconds(30);
 
-  public CaRotatorVert( Vertx vertx, KubernetesClient kubeClient, NatsTLSClient natsTLSClient,
+  public CaRotatorVert(Vertx vertx, KubernetesClient kubeClient, NatsTLSClient natsTLSClient,
                        MetadataVaultHandler metadataVaultHandler, MetadataConfig config,
-                       DilithiumService signer, KeySecretManager keyCache )
+                       DilithiumService signer, KeySecretManager keyCache)
   {
     this.vertx = vertx;
     this.kubeClient = kubeClient;
-    this.natsTLSClient = natsTLSClient;  // Updated reference
+    this.natsTLSClient = natsTLSClient;
     this.metadataVaultHandler = metadataVaultHandler;
     this.config = config;
     this.signer = signer;
     this.keyCache = keyCache;
 
     this.namespace = kubeClient.getNamespace();
-    LOGGER.info( "CaRotatorVert initialized in namespace: {}", namespace );
+    LOGGER.info("CaRotatorVert initialized in namespace: {}", namespace);
   }
 
   @Override
@@ -112,112 +99,281 @@ public class CaRotatorVert extends AbstractVerticle
   {
     try
     {
-      workerExecutor = vertx.createSharedWorkerExecutor( "ca-rotator-worker", 2, 360000 );
+      workerExecutor = vertx.createSharedWorkerExecutor("ca-rotator-worker", 2, 360000);
+
+      // Log configuration on startup
+      LOGGER.info("=== CA ROTATOR CONFIGURATION ===");
+      LOGGER.info(caEpochUtil.getConfigDescription());
+//      LOGGER.info("Initial delay: {} minutes", getInitialDelayMillis() / 60000);
+      
+      // Show rotation schedule for debugging
+      Instant now = Instant.now();
+      long currentEpoch = caEpochUtil.epochNumberForInstant(now);
+      LOGGER.info("Current time: {}", now);
+      LOGGER.info("Current epoch: {}", currentEpoch);
+      LOGGER.info("Epoch start: {}", caEpochUtil.epochStart(currentEpoch));
+      LOGGER.info("Next rotation time: {}", caEpochUtil.epochRotationTime(currentEpoch));
+      LOGGER.info("Cert expiry for this epoch: {}", caEpochUtil.epochExpiry(currentEpoch));
+      LOGGER.info("Prune time for this epoch: {}", caEpochUtil.epochPruneTime(currentEpoch));
+      LOGGER.info("Check interval: {} minutes", caEpochUtil.getCheckInterval().toMinutes());
+
+      startupInstant      = Instant.now();
+  
+      LOGGER.info( "Initial Delay ms set to: " + initialDelayMs );
+      LOGGER.info("================================");
+
+      startupTimerId = vertx.setTimer( initialDelayMs, id -> 
+      {
+        startupTimerId = -1;
+        LOGGER.info("Initial rotation delay elapsed ({} ms). Performing first rotation check.", initialDelayMs);
+        doRotationCheck();
+
+        timerId = vertx.setPeriodic(caEpochUtil.getCheckInterval().toMillis(), t -> doRotationCheck());
+      });
+
+      LOGGER.info("CaRotatorVert started with NATS support (initialDelayMs={} ms)", initialDelayMs);
+      LOGGER.info("Periodic rotation checks will run every {} milliseconds", caEpochUtil.getCheckInterval().toMillis());
+    }
+    catch (Exception e)
+    {
+      LOGGER.error("Failed to start CaRotatorVert: {}", e.getMessage(), e);
+      throw e;
+    }
+  }
+  
+  /**
+  @Override
+  public void start() throws Exception
+  {
+    try
+    {
+      workerExecutor = vertx.createSharedWorkerExecutor("ca-rotator-worker", 2, 360000);
 
       startupInstant = Instant.now();
       long initialDelayMs = getInitialDelayMillis();
 
-      startupTimerId = vertx.setTimer( initialDelayMs, id -> {
-          startupTimerId = -1;
-          LOGGER.info("Initial rotation delay elapsed ({} ms). Performing first rotation check.", initialDelayMs);
-          doRotationCheck();
-          timerId = vertx.setPeriodic( caEpochUtil.getCheckInterval().toMillis(), t -> doRotationCheck() );
+      startupTimerId = vertx.setTimer(initialDelayMs, id -> {
+        startupTimerId = -1;
+        LOGGER.info("Initial rotation delay elapsed ({} ms). Performing first rotation check.", initialDelayMs);
+        doRotationCheck();
+        timerId = vertx.setPeriodic(caEpochUtil.getCheckInterval().toMillis(), t -> doRotationCheck());
       });
 
       LOGGER.info("CaRotatorVert started with NATS support (initialDelayMs={} ms)", initialDelayMs);
     }
-    catch( Exception e )
+    catch (Exception e)
     {
-      LOGGER.error( "Failed to start CaRotatorVert: {}", e.getMessage(), e );
+      LOGGER.error("Failed to start CaRotatorVert: {}", e.getMessage(), e);
       throw e;
     }
   }
-
+*/
+  
   @Override
   public void stop() throws Exception
   {
     try
     {
-      if( timerId != -1 )
+      if (timerId != -1)
       {
-        vertx.cancelTimer( timerId );
+        vertx.cancelTimer(timerId);
         timerId = -1;
       }
 
-      if( startupTimerId != -1 )
+      if (startupTimerId != -1)
       {
-        vertx.cancelTimer( startupTimerId );
+        vertx.cancelTimer(startupTimerId);
         startupTimerId = -1;
       }
 
-      if( workerExecutor != null )
+      if (workerExecutor != null)
         workerExecutor.close();
     }
-    catch( Exception ignored )
+    catch (Exception ignored)
     {
-      LOGGER.warn( "Error shutting down CaRotatorVert: {}", ignored.getMessage() );
+      LOGGER.warn("Error shutting down CaRotatorVert: {}", ignored.getMessage());
     }
     LOGGER.info("CaRotatorVert stopped");
   }
 
+/**  
   private long getInitialDelayMillis()
   {
     try
     {
       String minEnv = System.getenv("CA_ROTATOR_INITIAL_DELAY_MINUTES");
-      if( minEnv != null && !minEnv.isBlank() )
+      if (minEnv != null && !minEnv.isBlank())
       {
         long mins = Long.parseLong(minEnv.trim());
         return Duration.ofMinutes(Math.max(0, mins)).toMillis();
       }
 
       String msEnv = System.getenv("CA_ROTATOR_INITIAL_DELAY_MS");
-      if( msEnv != null && !msEnv.isBlank()) {
+      if (msEnv != null && !msEnv.isBlank())
+      {
         long ms = Long.parseLong(msEnv.trim());
         return Math.max(0L, ms);
       }
-    } catch (Exception e) {
-      LOGGER.warn("Failed to parse CA_ROTATOR_INITIAL_DELAY env var, using default: {} ms", INITIAL_ROTATION_DELAY.toMillis());
+    }
+    catch (Exception e)
+    {
+      LOGGER.warn("Failed to parse CA_ROTATOR_INITIAL_DELAY env var, using default: {} ms", 
+        INITIAL_ROTATION_DELAY.toMillis());
     }
     return INITIAL_ROTATION_DELAY.toMillis();
   }
-
+*/
   /**
-   * Enhanced rotation check with retry logic
+   * Check if rotation is needed
    */
   private void doRotationCheck()
   {
     Instant now = Instant.now();
 
-    long initialDelayMs = getInitialDelayMillis();
-    if (startupInstant != null && now.isBefore(startupInstant.plusMillis(initialDelayMs))) {
+    if (startupInstant != null && now.isBefore(startupInstant.plusMillis(initialDelayMs)))
+    {
       LOGGER.info("Initial rotation delay still in effect; skipping rotation check.");
       return;
     }
 
-    long    currentEpoch   = caEpochUtil.epochNumberForInstant( now );
-    boolean rotationNeeded = caEpochUtil.isRotationNeeded(now );
-    Instant rotationTime   = caEpochUtil.epochRotationTime( currentEpoch );
+    long currentEpoch = caEpochUtil.epochNumberForInstant(now);
+    Instant currentEpochStart = caEpochUtil.epochStart(currentEpoch);
+    Instant nextEpochStart = caEpochUtil.epochStart(currentEpoch + 1);
+    
+    // Enhanced logging - always use INFO level for rotation checks
+    LOGGER.info("=== CA ROTATION CHECK ===");
+    LOGGER.info("Current time: {}", now);
+    LOGGER.info("Current epoch: {}", currentEpoch);
+    LOGGER.info("Current epoch started: {}", currentEpochStart);
+    LOGGER.info("Next epoch starts: {}", nextEpochStart);
+    LOGGER.info("Last rotated epoch: {}", lastRotatedEpoch);
+    
+    // Check if we need to rotate for the current epoch
+    boolean rotationNeeded = (currentEpoch > lastRotatedEpoch);
+    
+    LOGGER.info("Rotation needed: {}", rotationNeeded);
+    
+    // Show time until next rotation
+    if (!rotationNeeded) {
+      Duration timeUntilRotation = Duration.between(now, nextEpochStart);
+      LOGGER.info("Time until next epoch: {} minutes {} seconds", 
+        timeUntilRotation.toMinutes(), timeUntilRotation.toSecondsPart());
+    }
+    LOGGER.info("========================");
 
-    LOGGER.info("CA Epoch Check: epoch={} rotationNeeded={} nextRotation={}", currentEpoch, rotationNeeded, rotationTime);
-
-    if( !rotationNeeded ) {
-      LOGGER.debug("No CA rotation needed at this time.");
+    if (!rotationNeeded)
+    {
+      LOGGER.info("No CA rotation needed - already rotated for epoch {}", currentEpoch);
       return;
     }
 
-    // Prevent performing rotation more than once for the same epoch.
-    if (currentEpoch == lastRotatedEpoch) {
-      LOGGER.info("Rotation for epoch {} already performed; skipping duplicate rotation.", currentEpoch);
-      return;
-    }
-
+    LOGGER.info("Starting rotation for epoch {}", currentEpoch);
     performRotationWithRetry(currentEpoch, 0);
   }
-
+  
   /**
-   * Enhanced rotation with retry logic. Stores the ca bundle in OpenBao
+   * Enhanced rotation with retry logic and grace period-based issuer cleanup
    */
+  private void performRotationWithRetry(long currentEpoch, int attemptCount)
+  {
+    if (attemptCount >= MAX_ROTATION_RETRIES)
+    {
+      LOGGER.error("Maximum rotation attempts ({}) exceeded for epoch {}", MAX_ROTATION_RETRIES, currentEpoch);
+      return;
+    }
+
+    if (attemptCount == 0)
+    {
+      LOGGER.info("=== STARTING CA ROTATION PROCESS ===");
+      LOGGER.info("CA Rotation Start - Epoch: {}, Time: {}", currentEpoch, Instant.now());
+      LOGGER.info("Certificate TTL: {}, Grace Period: {}", 
+        caEpochUtil.getCertificateTTL().toMinutes() + "m",
+        caEpochUtil.getGracePeriod().toMinutes() + "m");
+    }
+
+    LOGGER.info("CA Rotation Progress - Epoch: {}, Attempt: {}/{}", 
+      currentEpoch, attemptCount + 1, MAX_ROTATION_RETRIES);
+
+    performRotation()
+      .<String>compose(newBundle -> buildPublishedBundle(newBundle))
+      .<String>compose(mergedBundle -> persistLocalCaBundle(mergedBundle).<String>map(ignored -> mergedBundle))
+      .<CaBundle>compose(mergedBundle -> buildCaBundle("NATS", mergedBundle))
+      .<CaBundle>compose(caBundle -> {
+        LOGGER.info("Storing CA bundle in Vault for epoch {}", currentEpoch);
+        return metadataVaultHandler.putCaBundle("NATS", currentEpoch, caBundle)
+          .<CaBundle>map(ignored -> caBundle)
+          .recover(err -> {
+            LOGGER.error("Failed to store CA bundle in Vault (non-fatal): {}", err.getMessage(), err);
+            return Future.succeededFuture(caBundle);
+          });
+      })
+      .<CaBundle>compose(caBundle -> publishCARotationEventWithRetry("NATS", caBundle.getCaBundle(), 0).<CaBundle>map(ignored -> caBundle))
+      .<CaBundle>compose(caBundle -> {
+        try
+        {
+          return natsTLSClient.handleCaBundleUpdate(caBundle)
+            .recover(err -> {
+              LOGGER.warn("Local NATS client CA update failed (non-fatal): {}", err.getMessage());
+              return Future.succeededFuture();
+            })
+            .<CaBundle>map(ignored -> caBundle);
+        }
+        catch (Exception e)
+        {
+          LOGGER.warn("Local NATS client CA update threw an exception (non-fatal): {}", e.getMessage());
+          return Future.succeededFuture(caBundle);
+        }
+      })
+      // ENHANCED: Prune expired issuers based on grace period
+      .<CaBundle>compose(caBundle -> {
+        LOGGER.info("Pruning expired issuers from PKI mount (grace period: {} minutes)", 
+          caEpochUtil.getGracePeriod().toMinutes());
+        
+        return metadataVaultHandler.pruneExpiredIssuers(NATS_PKI_MOUNT, caEpochUtil)
+          .<CaBundle>map(deletedCount -> {
+            LOGGER.info("Pruned {} expired issuers from PKI mount", deletedCount);
+            return caBundle;
+          })
+          .recover(err -> {
+            LOGGER.warn("Failed to prune expired issuers (non-fatal): {}", err.getMessage());
+            return Future.succeededFuture(caBundle);
+          });
+      })
+      // Prune old CA bundles
+      .<CaBundle>compose(caBundle -> {
+        int keepLastN = caEpochUtil.getMaxCertsInBundle();
+        LOGGER.info("Pruning old CA bundles, keeping last {} bundles", keepLastN);
+        
+        return metadataVaultHandler.pruneOldCaBundles("NATS", keepLastN)
+          .<CaBundle>map(deletedCount -> {
+            LOGGER.info("Pruned {} old CA bundles", deletedCount);
+            return caBundle;
+          })
+          .recover(err -> {
+            LOGGER.warn("Failed to prune old CA bundles (non-fatal): {}", err.getMessage());
+            return Future.succeededFuture(caBundle);
+          });
+      })
+      .onSuccess(result -> {
+        lastRotatedEpoch = currentEpoch;
+        LOGGER.info("=== COMPLETED CA ROTATION FOR EPOCH {} ===", currentEpoch);
+        LOGGER.info("Next rotation scheduled at: {}", caEpochUtil.epochRotationTime(currentEpoch + 1));
+      })
+      .onFailure(err -> {
+        String errorMsg = String.format("CA rotation attempt %d failed for epoch %d: %s", 
+          attemptCount + 1, currentEpoch, err.getMessage());
+        LOGGER.error(errorMsg, err);
+
+        long retryDelayMs = ROTATION_RETRY_DELAY.toMillis() * (1L << attemptCount);
+        vertx.setTimer(retryDelayMs, id -> {
+          LOGGER.info("Retrying CA rotation for epoch {} after {} ms delay", currentEpoch, retryDelayMs);
+          performRotationWithRetry(currentEpoch, attemptCount + 1);
+        });
+      });
+  }  
+  
+  /**
+   * Enhanced rotation with retry logic and issuer cleanup
   private void performRotationWithRetry(long currentEpoch, int attemptCount)
   {
     if (attemptCount >= MAX_ROTATION_RETRIES)
@@ -232,46 +388,56 @@ public class CaRotatorVert extends AbstractVerticle
       LOGGER.info("CA Rotation Start - Epoch: {}, Time: {}", currentEpoch, Instant.now());
     }
 
-    LOGGER.info("CA Rotation Progress - Epoch: {}, Attempt: {}/{}", currentEpoch, attemptCount + 1, MAX_ROTATION_RETRIES);
+    LOGGER.info("CA Rotation Progress - Epoch: {}, Attempt: {}/{}", 
+      currentEpoch, attemptCount + 1, MAX_ROTATION_RETRIES);
 
     performRotation()
-      // newBundle -> mergedBundle
       .compose(newBundle -> buildPublishedBundle(newBundle))
-      // persistLocalCaBundle returns Future<Void>; map back to mergedBundle so next compose gets it
       .compose(mergedBundle -> persistLocalCaBundle(mergedBundle).map(ignored -> mergedBundle))
-      // NEW: build local CaBundle
       .compose(mergedBundle -> buildCaBundle("NATS", mergedBundle))
-      // NEW: Store CA bundle in Vault for bootstrap capability
       .compose(caBundle -> {
         LOGGER.info("Storing CA bundle in Vault for epoch {}", currentEpoch);
         return metadataVaultHandler.putCaBundle("NATS", currentEpoch, caBundle)
           .map(ignored -> caBundle)
           .recover(err -> {
             LOGGER.error("Failed to store CA bundle in Vault (non-fatal): {}", err.getMessage(), err);
-            // Continue with rotation even if Vault storage fails
             return Future.succeededFuture(caBundle);
           });
       })
-      // Publish the CA rotation SignedMessage BEFORE we update our own client.
-      // This ensures the rotation message is sent while the existing (old) connection/consumers are still active.
       .compose(caBundle -> publishCARotationEventWithRetry("NATS", caBundle.getCaBundle(), 0).map(ignored -> caBundle))
-      // After successfully publishing, update local client (apply new CA locally).
       .compose(caBundle -> {
-        try {
+        try
+        {
           return natsTLSClient.handleCaBundleUpdate(caBundle)
             .recover(err -> {
               LOGGER.warn("Local NATS client CA update failed (non-fatal): {}", err.getMessage());
               return Future.succeededFuture();
             })
             .map(ignored -> caBundle);
-        } catch (Exception e) {
+        }
+        catch (Exception e)
+        {
           LOGGER.warn("Local NATS client CA update threw an exception (non-fatal): {}", e.getMessage());
           return Future.succeededFuture(caBundle);
         }
       })
-      // NEW: Prune old CA bundles after successful rotation
+      // ENHANCED: Prune old issuers from PKI mount
       .compose(caBundle -> {
-        // Keep last 3 CA bundles for overlap support
+        int keepLastN = caEpochUtil.getMaxCertsInBundle();
+        LOGGER.info("Pruning old issuers from PKI mount, keeping last {}", keepLastN);
+        
+        return metadataVaultHandler.pruneOldIssuers(NATS_PKI_MOUNT, keepLastN)
+          .map(deletedCount -> {
+            LOGGER.info("Pruned {} old issuers from PKI mount", deletedCount);
+            return caBundle;
+          })
+          .recover(err -> {
+            LOGGER.warn("Failed to prune old issuers (non-fatal): {}", err.getMessage());
+            return Future.succeededFuture(caBundle);
+          });
+      })
+      // Prune old CA bundles
+      .compose(caBundle -> {
         int keepLastN = caEpochUtil.getMaxCertsInBundle();
         LOGGER.info("Pruning old CA bundles, keeping last {} bundles", keepLastN);
         
@@ -290,7 +456,8 @@ public class CaRotatorVert extends AbstractVerticle
         LOGGER.info("Successfully completed CA rotation and storage for epoch {}", currentEpoch);
       })
       .onFailure(err -> {
-        String errorMsg = String.format("CA rotation attempt %d failed for epoch %d: %s", attemptCount + 1, currentEpoch, err.getMessage());
+        String errorMsg = String.format("CA rotation attempt %d failed for epoch %d: %s", 
+          attemptCount + 1, currentEpoch, err.getMessage());
         LOGGER.error(errorMsg, err);
 
         long retryDelayMs = ROTATION_RETRY_DELAY.toMillis() * (1L << attemptCount);
@@ -300,10 +467,443 @@ public class CaRotatorVert extends AbstractVerticle
         });
       });
   }
+   */
+
+  /**
+   * Perform rotation with snapshot-before-sign approach
+   */
+  private Future<String> performRotation()
+  {
+    LOGGER.info("Performing NATS CA rotation (snapshot-before-sign)...");
+
+    return Future.<String>future(promise -> {
+      metadataVaultHandler.preCollectExistingCertificates(NATS_PKI_MOUNT, VAULT_ROOT_CA_PATH)
+        .onFailure(preErr -> {
+          LOGGER.warn("Pre-collection failed, continuing with empty snapshot: {}", preErr.getMessage());
+          MetadataVaultHandler.ExistingCertificates emptySnapshot =
+            new MetadataVaultHandler.ExistingCertificates(new ArrayList<>(), null);
+          proceedWithSnapshot(emptySnapshot, promise);
+        })
+        .onSuccess(existingSnapshot -> {
+          proceedWithSnapshot(existingSnapshot, promise);
+        });
+    });
+  }
+
+  /**
+   * Proceed with snapshot using NEW key generation for each rotation
+   * 
+   * With internal key storage, OpenBao automatically associates the signed certificate
+   * with the key that generated the CSR. If the import succeeds, the association is guaranteed.
+   */
+  private void proceedWithSnapshot(MetadataVaultHandler.ExistingCertificates existingSnapshot, 
+                                    Promise<String> outerPromise)
+  {
+    // Generate unique key name for this rotation
+    Instant now = Instant.now();
+    long currentEpoch = caEpochUtil.epochNumberForInstant(now);
+    String keyName = "nats-int-key-" + currentEpoch;
+    
+    LOGGER.info("Generating NEW internal key and CSR for epoch {} with name: {}", currentEpoch, keyName);
+    
+    // Generate key AND CSR in one operation to ensure they match
+    // Using internal storage - private key never leaves OpenBao
+    metadataVaultHandler.generateNewKeyAndCsr(
+        NATS_PKI_MOUNT, 
+        "NATS Intermediate Authority",
+        keyName,
+        CERT_TYPE, 
+        CERT_STRENGTH
+      )
+      .onFailure(genErr -> {
+        LOGGER.error("Failed to generate new key and CSR", genErr);
+        outerPromise.fail(genErr);
+      })
+      .onSuccess(csrWithKey -> {
+        LOGGER.info("Generated NEW key and intermediate CSR (keyId={})", csrWithKey.getKeyId());
+
+        // Verify key ID is not null
+        if (csrWithKey.getKeyId() == null || csrWithKey.getKeyId().isEmpty()) {
+          String msg = "Failed to get key ID from CSR generation";
+          LOGGER.error(msg);
+          outerPromise.fail(msg);
+          return;
+        }
+
+        // Sign CSR with root CA
+        metadataVaultHandler.signCsrWithRoot(VAULT_ROOT_CA_PATH, csrWithKey.getCsr(), 
+                                             caEpochUtil.buildCaTTLString())
+          .onFailure(signErr -> {
+            LOGGER.error("Failed to sign CSR with root", signErr);
+            outerPromise.fail(signErr);
+          })
+          .onSuccess(signedCert -> {
+            LOGGER.info("Received signed intermediate from root ({} chars)", 
+              signedCert != null ? signedCert.length() : 0);
+
+            if (!isValidPemCertificate(signedCert))
+            {
+              String msg = "Invalid PEM in signed certificate from root";
+              LOGGER.error(msg);
+              outerPromise.fail(msg);
+              return;
+            }
+
+            // Import signed cert - automatically associates with the internal key
+            metadataVaultHandler.setIntermediateSignedCertificateInternal(NATS_PKI_MOUNT, signedCert)
+              .onFailure(setErr -> {
+                LOGGER.error("Failed to set signed intermediate on PKI mount", setErr);
+                outerPromise.fail(setErr);
+              })
+              .onSuccess(issuerId -> {
+                LOGGER.info("✅ Imported signed certificate as issuer: {}", issuerId);
+                LOGGER.info("   Associated with internal key: {}", csrWithKey.getKeyId());
+                LOGGER.info("   Key name: {}", keyName);
+
+                // Set default issuer
+                Future<Void> setDefaultFuture;
+                if (issuerId != null && !issuerId.isEmpty())
+                {
+                  LOGGER.info("Setting default issuer to: {}", issuerId);
+                  setDefaultFuture = metadataVaultHandler.setDefaultIssuer(NATS_PKI_MOUNT, issuerId)
+                    .recover(setDefaultErr -> {
+                      LOGGER.warn("Unable to set default issuer (non-fatal): {}", setDefaultErr.getMessage());
+                      return Future.succeededFuture((Void) null);
+                    });
+                }
+                else
+                {
+                  LOGGER.warn("⚠️  No issuer ID found - default issuer not set");
+                  setDefaultFuture = Future.succeededFuture((Void) null);
+                }
+
+                setDefaultFuture
+                  .compose(ignored -> waitForProcessing(1500))
+                  .compose(v2 -> metadataVaultHandler.buildCompleteCABundleWithNew(existingSnapshot, signedCert))
+                  .onSuccess(mergedBundle -> {
+                    LOGGER.info("Built merged CA bundle ({} chars)", 
+                      mergedBundle != null ? mergedBundle.length() : 0);
+                    outerPromise.complete(mergedBundle);
+                  })
+                  .onFailure(buildErr -> {
+                    LOGGER.error("Failed to build merged CA bundle", buildErr);
+                    outerPromise.fail(buildErr);
+                  });
+              });
+          });
+      });
+  }
   
   /**
-   * Persist the merged CA bundle locally (update secret and any local files).
-   * Returns Future<Void>.
+   * Proceed with snapshot using NEW key generation for each rotation (CORRECTED)
+  private void proceedWithSnapshot(MetadataVaultHandler.ExistingCertificates existingSnapshot, 
+                                    Promise<String> outerPromise)
+  {
+    // Generate unique key name for this rotation
+    Instant now = Instant.now();
+    long currentEpoch = caEpochUtil.epochNumberForInstant(now);
+    String keyName = "nats-int-key-" + currentEpoch;
+    
+    LOGGER.info("Generating NEW internal key and CSR for epoch {} with name: {}", currentEpoch, keyName);
+    
+    // CORRECTED: Generate key AND CSR in one operation to ensure they match
+    metadataVaultHandler.generateNewKeyAndCsr(
+        NATS_PKI_MOUNT, 
+        "NATS Intermediate Authority",
+        keyName,
+        CERT_TYPE, 
+        CERT_STRENGTH
+      )
+      .onFailure(genErr -> {
+        LOGGER.error("Failed to generate new key and CSR", genErr);
+        outerPromise.fail(genErr);
+      })
+      .onSuccess(csrWithKey -> {
+        LOGGER.info("Generated NEW key and intermediate CSR (keyId={})", csrWithKey.getKeyId());
+
+        // Verify key ID is not null
+        if (csrWithKey.getKeyId() == null || csrWithKey.getKeyId().isEmpty()) {
+          String msg = "Failed to get key ID from CSR generation";
+          LOGGER.error(msg);
+          outerPromise.fail(msg);
+          return;
+        }
+
+        // Sign CSR with root
+        metadataVaultHandler.signCsrWithRoot(VAULT_ROOT_CA_PATH, csrWithKey.getCsr(), 
+                                             caEpochUtil.buildCaTTLString())
+          .onFailure(signErr -> {
+            LOGGER.error("Failed to sign CSR with root", signErr);
+            outerPromise.fail(signErr);
+          })
+          .onSuccess(signedCert -> {
+            LOGGER.info("Received signed intermediate from root ({} chars)", 
+              signedCert != null ? signedCert.length() : 0);
+
+            if (!isValidPemCertificate(signedCert))
+            {
+              String msg = "Invalid PEM in signed certificate from root";
+              LOGGER.error(msg);
+              outerPromise.fail(msg);
+              return;
+            }
+
+            // Import signed cert (associates with the key automatically)
+            metadataVaultHandler.setIntermediateSignedCertificateInternal(NATS_PKI_MOUNT, signedCert)
+              .onFailure(setErr -> {
+                LOGGER.error("Failed to set signed intermediate on PKI mount", setErr);
+                outerPromise.fail(setErr);
+              })
+              .onSuccess(issuerId -> {
+                LOGGER.info("Set intermediate signed certificate, issuerId={}, keyId={}", 
+                  issuerId, csrWithKey.getKeyId());
+
+                // Verify the issuer is using the correct key
+                metadataVaultHandler.getIssuerInfo(NATS_PKI_MOUNT, issuerId)
+                  .onSuccess(issuerInfo -> {
+                    JsonObject data = issuerInfo.getJsonObject("data");
+                    String issuerKeyId = data != null ? data.getString("key_id") : null;
+                    
+                    if (!csrWithKey.getKeyId().equals(issuerKeyId)) {
+                      LOGGER.error("⚠️ KEY MISMATCH! Expected: {}, Got: {}", 
+                        csrWithKey.getKeyId(), issuerKeyId);
+                    } else {
+                      LOGGER.info("✅ Verified issuer {} is using correct key {}", 
+                        issuerId, issuerKeyId);
+                    }
+                  })
+                  .onFailure(err -> {
+                    LOGGER.warn("Could not verify issuer key (non-fatal): {}", err.getMessage());
+                  });
+
+                // Set default issuer
+                Future<Void> setDefaultFuture;
+                if (issuerId != null && !issuerId.isEmpty())
+                {
+                  LOGGER.info("Setting default issuer to: {}", issuerId);
+                  setDefaultFuture = metadataVaultHandler.setDefaultIssuer(NATS_PKI_MOUNT, issuerId)
+                    .recover(setDefaultErr -> {
+                      LOGGER.warn("Unable to set default issuer (non-fatal): {}", setDefaultErr.getMessage());
+                      return Future.succeededFuture((Void) null);
+                    });
+                }
+                else
+                {
+                  LOGGER.warn("⚠️  No issuer ID found - default issuer not set");
+                  setDefaultFuture = Future.succeededFuture((Void) null);
+                }
+
+                setDefaultFuture
+                  .compose(ignored -> waitForProcessing(1500))
+                  .compose(v2 -> metadataVaultHandler.buildCompleteCABundleWithNew(existingSnapshot, signedCert))
+                  .onSuccess(mergedBundle -> {
+                    LOGGER.info("Built merged CA bundle ({} chars)", 
+                      mergedBundle != null ? mergedBundle.length() : 0);
+                    outerPromise.complete(mergedBundle);
+                  })
+                  .onFailure(buildErr -> {
+                    LOGGER.error("Failed to build merged CA bundle", buildErr);
+                    outerPromise.fail(buildErr);
+                  });
+              });
+          });
+      });
+  }
+   */
+  
+  /**
+   * Proceed with snapshot using NEW key generation for each rotation
+  private void proceedWithSnapshot(MetadataVaultHandler.ExistingCertificates existingSnapshot, 
+                                    Promise<String> outerPromise)
+  {
+    // Generate unique key name for this rotation
+    Instant now = Instant.now();
+    long currentEpoch = caEpochUtil.epochNumberForInstant(now);
+    String keyName = "nats-int-key-" + currentEpoch;
+    
+    LOGGER.info("Generating NEW internal key for epoch {} with name: {}", currentEpoch, keyName);
+    
+    // Step 1: Generate new key
+    metadataVaultHandler.generateNewKey(NATS_PKI_MOUNT, keyName, CERT_TYPE, CERT_STRENGTH)
+      .onFailure(keyErr -> {
+        LOGGER.error("Failed to generate new key", keyErr);
+        outerPromise.fail(keyErr);
+      })
+      .onSuccess(keyId -> {
+        LOGGER.info("Generated new key with ID: {}", keyId);
+        
+        // Step 2: Generate CSR using the new key
+        metadataVaultHandler.generateIntermediateCsrWithKeyRef(
+            NATS_PKI_MOUNT, 
+            "NATS Intermediate Authority",
+            keyName  // Use key name as reference
+          )
+          .onFailure(genErr -> {
+            LOGGER.error("Failed to generate intermediate CSR", genErr);
+            outerPromise.fail(genErr);
+          })
+          .onSuccess(csrWithKey -> {
+            LOGGER.info("Generated intermediate CSR with key {}", keyId);
+
+            // Step 3: Sign CSR with root
+            metadataVaultHandler.signCsrWithRoot(VAULT_ROOT_CA_PATH, csrWithKey.getCsr(), 
+                                                 caEpochUtil.buildCaTTLString())
+              .onFailure(signErr -> {
+                LOGGER.error("Failed to sign CSR with root", signErr);
+                outerPromise.fail(signErr);
+              })
+              .onSuccess(signedCert -> {
+                LOGGER.info("Received signed intermediate from root ({} chars)", 
+                  signedCert != null ? signedCert.length() : 0);
+
+                if (!isValidPemCertificate(signedCert))
+                {
+                  String msg = "Invalid PEM in signed certificate from root";
+                  LOGGER.error(msg);
+                  outerPromise.fail(msg);
+                  return;
+                }
+
+                // Step 4: Import signed cert (associates with the key automatically)
+                metadataVaultHandler.setIntermediateSignedCertificateInternal(NATS_PKI_MOUNT, signedCert)
+                  .onFailure(setErr -> {
+                    LOGGER.error("Failed to set signed intermediate on PKI mount", setErr);
+                    outerPromise.fail(setErr);
+                  })
+                  .onSuccess(issuerId -> {
+                    LOGGER.info("Set intermediate signed certificate, issuerId={}", issuerId);
+
+                    // Set default issuer
+                    Future<Void> setDefaultFuture;
+                    if (issuerId != null && !issuerId.isEmpty())
+                    {
+                      LOGGER.info("Setting default issuer to: {}", issuerId);
+                      setDefaultFuture = metadataVaultHandler.setDefaultIssuer(NATS_PKI_MOUNT, issuerId)
+                        .recover(setDefaultErr -> {
+                          LOGGER.warn("Unable to set default issuer (non-fatal): {}", setDefaultErr.getMessage());
+                          return Future.succeededFuture((Void) null);
+                        });
+                    }
+                    else
+                    {
+                      LOGGER.warn("⚠️  No issuer ID found - default issuer not set");
+                      setDefaultFuture = Future.succeededFuture((Void) null);
+                    }
+
+                    setDefaultFuture
+                      .compose(ignored -> waitForProcessing(1500))
+                      .compose(v2 -> metadataVaultHandler.buildCompleteCABundleWithNew(existingSnapshot, signedCert))
+                      .onSuccess(mergedBundle -> {
+                        LOGGER.info("Built merged CA bundle ({} chars)", 
+                          mergedBundle != null ? mergedBundle.length() : 0);
+                        outerPromise.complete(mergedBundle);
+                      })
+                      .onFailure(buildErr -> {
+                        LOGGER.error("Failed to build merged CA bundle", buildErr);
+                        outerPromise.fail(buildErr);
+                      });
+                  });
+              });
+          });
+      });
+  }
+   */
+  
+  /**
+   * Build published bundle with existing certs
+   */
+  private Future<String> buildPublishedBundle(String newBundle)
+  {
+    return metadataVaultHandler.getCAChainEnhanced(VAULT_ROOT_CA_PATH)
+      .recover(err -> {
+        LOGGER.warn("Failed to get enhanced root CA chain, trying standard: {}", err.getMessage());
+        return metadataVaultHandler.getCAChainEnhanced(VAULT_ROOT_CA_PATH);
+      })
+      .compose(rootBundle -> workerExecutor.executeBlocking(() -> {
+        try
+        {
+          List<String> parts = new ArrayList<>();
+
+          // Existing intermediates from local secret
+          try
+          {
+            Secret existing = kubeClient.secrets().inNamespace(namespace)
+              .withName(LOCAL_CA_SECRET_NAME).get();
+            if (existing != null && existing.getData() != null && 
+                existing.getData().containsKey(LOCAL_CA_SECRET_KEY))
+            {
+              String existingB64 = existing.getData().get(LOCAL_CA_SECRET_KEY);
+              if (existingB64 != null && !existingB64.isBlank())
+              {
+                String existingPem = decodeSecretData(existingB64);
+                if (existingPem != null && isValidPemBundle(existingPem))
+                {
+                  List<String> existingCerts = splitPemCertificates(existingPem);
+                  parts.addAll(existingCerts);
+                  LOGGER.info("Found {} certificate(s) in existing {} secret", 
+                    existingCerts.size(), LOCAL_CA_SECRET_NAME);
+                }
+              }
+            }
+          }
+          catch (Exception e)
+          {
+            LOGGER.warn("Error reading existing {} secret: {}", LOCAL_CA_SECRET_NAME, e.getMessage());
+          }
+
+          // New bundle
+          if (newBundle != null && !newBundle.trim().isEmpty())
+          {
+            if (isValidPemBundle(newBundle))
+            {
+              List<String> newCerts = splitPemCertificates(newBundle);
+              parts.addAll(newCerts);
+              LOGGER.info("New bundle contains {} certificate(s)", newCerts.size());
+            }
+          }
+
+          // Root bundle
+          if (rootBundle != null && !rootBundle.trim().isEmpty())
+          {
+            if (isValidPemBundle(rootBundle))
+            {
+              List<String> rootCerts = splitPemCertificates(rootBundle);
+              parts.addAll(rootCerts);
+              LOGGER.info("Root bundle contains {} certificate(s)", rootCerts.size());
+            }
+          }
+
+          // Deduplicate
+          LinkedHashMap<String, String> unique = new LinkedHashMap<>();
+          for (String certPem : parts)
+          {
+            String norm = certPem.replaceAll("\\r", "").trim();
+            if (!norm.isEmpty() && !unique.containsKey(norm))
+            {
+              unique.put(norm, norm);
+            }
+          }
+
+          StringBuilder merged = new StringBuilder();
+          for (String pem : unique.values())
+          {
+            if (merged.length() > 0) merged.append("\n");
+            merged.append(pem.trim());
+          }
+
+          String mergedPem = merged.toString();
+          LOGGER.info("Built merged PEM bundle with {} certificate(s)", unique.size());
+          return mergedPem;
+        }
+        catch (Exception e)
+        {
+          throw new RuntimeException("Failed to build published CA bundle: " + e.getMessage(), e);
+        }
+      }));
+  }
+
+  /**
+   * Persist local CA bundle
    */
   private Future<Void> persistLocalCaBundle(String mergedBundle)
   {
@@ -313,357 +913,33 @@ public class CaRotatorVert extends AbstractVerticle
         throw new RuntimeException("Invalid PEM format - cannot persist local CA bundle");
       }
 
-      // updateLocalCaBundle is your existing method which writes/updates the local K8s secret
-      // and/or local file for this metadata instance.
       updateLocalCaBundle(mergedBundle);
-
       LOGGER.info("Persisted local CA bundle successfully (metadata local secret updated)");
       return null;
     });
   }
-  
+
   /**
-   * Enhanced rotation with better error handling - Updated for NATS
+   * Update local CA bundle secret
    */
-  private Future<String> performRotation() {
-   LOGGER.info("Performing NATS CA rotation (snapshot-before-sign)...");
-
-   return Future.<String>future(promise -> {
-     // 1) Pre-collect existing chain snapshot BEFORE generating CSR
-     metadataVaultHandler.preCollectExistingCertificates(NATS_PKI_MOUNT, VAULT_ROOT_CA_PATH)  // Changed mount
-       .onFailure(preErr -> {
-         LOGGER.warn("Pre-collection failed, continuing with empty snapshot: {}", preErr.getMessage());
-         MetadataVaultHandler.ExistingCertificates emptySnapshot =
-             new MetadataVaultHandler.ExistingCertificates(new ArrayList<>(), null);
-         // proceed using empty snapshot
-         proceedWithSnapshot(emptySnapshot, promise);
-       })
-       .onSuccess(existingSnapshot -> {
-         // proceed with collected snapshot
-         proceedWithSnapshot(existingSnapshot, promise);
-       });
-   });
-  }
-
-  // Helper to run the remaining async steps using a captured snapshot and complete the outer promise
-  private void proceedWithSnapshot(MetadataVaultHandler.ExistingCertificates existingSnapshot, Promise<String> outerPromise) {
-   // 2) Generate CSR
-   metadataVaultHandler.generateIntermediateCsrInternal(NATS_PKI_MOUNT, "NATS Intermediate Authority", CERT_TYPE, CERT_STRENGTH)  // Changed description
-     .onFailure(genErr -> {
-       LOGGER.error("Failed to generate intermediate CSR", genErr);
-       outerPromise.fail(genErr);
-     })
-     .onSuccess(csrWithKey -> {
-       LOGGER.info("Generated intermediate CSR (keyId={})", csrWithKey.getKeyId());
-
-       // 3) Sign CSR with root (pem_bundle)
-       metadataVaultHandler.signCsrWithRoot(VAULT_ROOT_CA_PATH, csrWithKey.getCsr(), caEpochUtil.buildCaTTLString())
-         .onFailure(signErr -> {
-           LOGGER.error("Failed to sign CSR with root", signErr);
-           outerPromise.fail(signErr);
-         })
-         .onSuccess(signedCert -> {
-           LOGGER.info("Received signed intermediate from root ({} chars)", signedCert != null ? signedCert.length() : 0);
-
-           if (!isValidPemCertificate(signedCert)) {
-             String msg = "Invalid PEM in signed certificate from root";
-             LOGGER.error(msg);
-             outerPromise.fail(msg);
-             return;
-           }
-
-           // 4) Set the signed intermediate on the intermediate mount
-           metadataVaultHandler.setIntermediateSignedCertificateInternal(NATS_PKI_MOUNT, signedCert)  // Changed mount
-             .onFailure(setErr -> {
-               LOGGER.error("Failed to set signed intermediate on PKI mount", setErr);
-               outerPromise.fail(setErr);
-             })
-             .onSuccess(issuerId -> {
-               LOGGER.info("Set intermediate signed certificate, issuerId={}", issuerId);
-
-               // 5) Best-effort setDefaultIssuer (non-fatal), then wait and merge snapshot + new cert
-               Future<Void> setDefaultFuture;
-               if (issuerId != null) {
-                 setDefaultFuture = metadataVaultHandler.setDefaultIssuer(NATS_PKI_MOUNT, issuerId)  // Changed mount
-                   .recover(setDefaultErr -> {
-                     LOGGER.warn("Unable to set default issuer (non-fatal): {}", setDefaultErr.getMessage());
-                     return Future.succeededFuture((Void) null);
-                   });
-               } else {
-                 // nothing to do
-                 setDefaultFuture = Future.succeededFuture((Void) null);
-               }
-
-               setDefaultFuture
-                 .onComplete(ignored -> {
-                   // wait a short time for Vault to process
-                   waitForProcessing(1500)
-                     .onFailure(wErr -> {
-                       LOGGER.warn("waitForProcessing failed: {}", wErr.getMessage());
-                       // continue anyway
-                     })
-                     .onSuccess(v2 -> {
-                       // Build merged bundle: new signedCert + existing snapshot
-                       metadataVaultHandler.buildCompleteCABundleWithNew(existingSnapshot, signedCert)
-                         .onSuccess(mergedBundle -> {
-                           LOGGER.info("Built merged CA bundle ({} chars)", mergedBundle != null ? mergedBundle.length() : 0);
-                           outerPromise.complete(mergedBundle);
-                         })
-                         .onFailure(buildErr -> {
-                           LOGGER.error("Failed to build merged CA bundle", buildErr);
-                           outerPromise.fail(buildErr);
-                         });
-                     });
-                 });
-             });
-         });
-     });
-  }
-
-  /**
-   * Enhanced CA chain retrieval with fallback
-   private Future<String> getCAChainWithFallback(String pkiMount) {
-    return metadataVaultHandler.getCAChainEnhanced(pkiMount)
-      .recover(err -> {
-        LOGGER.warn("Enhanced CA chain retrieval failed, trying standard method: {}", err.getMessage());
-        // Fallback to standard CA chain retrieval if enhanced fails
-        return metadataVaultHandler.getCAChain(pkiMount)
-          .recover(fallbackErr -> {
-            LOGGER.error("Both enhanced and standard CA chain retrieval failed");
-            return Future.failedFuture("Failed to retrieve CA chain: " + fallbackErr.getMessage());
-          });
-      });
-  }
-  */
-
-  /**
-   * Enhanced bundle building with better format handling
-   */
-  private Future<String> buildPublishedBundle( String newBundle ) {
-    return metadataVaultHandler.getCAChainEnhanced(VAULT_ROOT_CA_PATH)
-      .recover(err -> {
-        LOGGER.warn("Failed to get enhanced root CA chain, trying standard: {}", err.getMessage());
-        return metadataVaultHandler.getCAChain(VAULT_ROOT_CA_PATH);
-      })
-      .compose(rootBundle -> workerExecutor.executeBlocking(() -> {
-        try {
-          List<String> parts = new ArrayList<>();
-
-          // 1) existing intermediate(s) from local nats-ca-secret (if present)
-          try {
-            Secret existing = kubeClient.secrets().inNamespace(namespace).withName(LOCAL_CA_SECRET_NAME).get();
-            if (existing != null && existing.getData() != null && existing.getData().containsKey(LOCAL_CA_SECRET_KEY)) {
-              String existingB64 = existing.getData().get(LOCAL_CA_SECRET_KEY);
-              if (existingB64 != null && !existingB64.isBlank()) {
-                String existingPem = decodeSecretData(existingB64);
-                if (existingPem != null && isValidPemBundle(existingPem)) {
-                  List<String> existingCerts = splitPemCertificates(existingPem);
-                  parts.addAll(existingCerts);
-                  LOGGER.info("Found {} certificate(s) in existing {} secret", existingCerts.size(), LOCAL_CA_SECRET_NAME);
-                } else {
-                  LOGGER.warn("Existing secret contains invalid PEM data, skipping");
-                }
-              }
-            } else {
-              LOGGER.info("No existing {} secret found or empty", LOCAL_CA_SECRET_NAME);
-            }
-          } catch (Exception e) {
-            LOGGER.warn("Error reading existing {} secret: {}", LOCAL_CA_SECRET_NAME, e.getMessage());
-          }
-
-          // 2) newly retrieved intermediate(s)
-          if (newBundle != null && !newBundle.trim().isEmpty()) {
-            if (isValidPemBundle(newBundle)) {
-              List<String> newCerts = splitPemCertificates(newBundle);
-              parts.addAll(newCerts);
-              LOGGER.info("New bundle contains {} certificate(s)", newCerts.size());
-            } else {
-              LOGGER.error("New bundle contains invalid PEM data");
-              throw new RuntimeException("Invalid PEM format in new certificate bundle");
-            }
-          }
-
-          // 3) root bundle returned by Vault (may contain one or more anchors)
-          if (rootBundle != null && !rootBundle.trim().isEmpty()) {
-            String processedRootBundle = processVaultResponse(rootBundle);
-            if (processedRootBundle != null && isValidPemBundle(processedRootBundle)) {
-              List<String> rootCerts = splitPemCertificates(processedRootBundle);
-              parts.addAll(rootCerts);
-              LOGGER.info("Root bundle contains {} certificate(s)", rootCerts.size());
-            } else {
-              LOGGER.warn("Root bundle from VAULT_ROOT_CA_PATH is invalid or empty");
-            }
-          } else {
-            LOGGER.warn("Root bundle from VAULT_ROOT_CA_PATH is empty");
-          }
-
-          // Deduplicate while preserving order
-          LinkedHashMap<String,String> unique = new LinkedHashMap<>();
-          for (String certPem : parts) {
-            String norm = certPem.replaceAll("\\r","").trim();
-            if (!norm.isEmpty() && !unique.containsKey(norm)) {
-              unique.put(norm, norm);
-            }
-          }
-
-          StringBuilder merged = new StringBuilder();
-          for (String pem : unique.values()) {
-            if (merged.length() > 0) merged.append("\n");
-            merged.append(pem.trim());
-          }
-
-          String mergedPem = merged.toString();
-          LOGGER.info("Built merged PEM bundle with {} certificate(s)", unique.size());
-          return mergedPem;
-        } catch (Exception e) {
-          throw new RuntimeException("Failed to build published CA bundle: " + e.getMessage(), e);
-        }
-      }));
-  }
-
-  /**
-   * Enhanced secret data decoding with format detection
-   */
-  private String decodeSecretData(String encodedData) {
-    try {
-      // First, try to decode as Base64
-      byte[] decoded = Base64.getDecoder().decode(encodedData);
-      String result = new String(decoded, StandardCharsets.UTF_8);
-      
-      // Verify it's valid PEM
-      if (isValidPemBundle(result)) {
-        return result;
-      } else {
-        LOGGER.warn("Decoded data is not valid PEM format");
-        return null;
-      }
-    } catch (Exception e) {
-      LOGGER.warn("Failed to decode secret data as Base64: {}", e.getMessage());
-      
-      // If Base64 decoding fails, check if it's already PEM
-      if (isValidPemBundle(encodedData)) {
-        LOGGER.info("Data appears to already be in PEM format");
-        return encodedData;
-      }
-      
-      return null;
-    }
-  }
-
-  /**
-   * Process Vault response to handle different formats
-   */
-  private String processVaultResponse(String vaultResponse) {
-    if (vaultResponse == null || vaultResponse.trim().isEmpty()) {
-      return null;
-    }
-
-    // Check if it's already valid PEM
-    if (isValidPemBundle(vaultResponse)) {
-      return vaultResponse;
-    }
-
-    // Try to decode as Base64 if it looks like Base64
-    if (BASE64_PATTERN.matcher(vaultResponse.trim()).matches()) {
-      try {
-        byte[] decoded = Base64.getDecoder().decode(vaultResponse.trim());
-        String decodedStr = new String(decoded, StandardCharsets.UTF_8);
-        if (isValidPemBundle(decodedStr)) {
-          LOGGER.info("Successfully decoded Vault response from Base64 to PEM");
-          return decodedStr;
-        }
-      } catch (Exception e) {
-        LOGGER.warn("Failed to decode Vault response as Base64: {}", e.getMessage());
-      }
-    }
-
-    // Check for binary data indicators
-    if (containsBinaryData(vaultResponse)) {
-      LOGGER.warn("Vault response appears to contain binary data, cannot process");
-      return null;
-    }
-
-    LOGGER.warn("Unable to process Vault response format");
-    return null;
-  }
-
-  /**
-   * Check if string contains binary data
-   */
-  private boolean containsBinaryData(String data) {
-    if (data == null) return false;
-    
-    // Look for null bytes or other control characters that indicate binary data
-    for (int i = 0; i < data.length(); i++) {
-      char c = data.charAt(i);
-      if (c == 0 || (c < 32 && c != '\n' && c != '\r' && c != '\t')) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Validate PEM certificate format
-   */
-  private boolean isValidPemCertificate(String pemData) {
-    if (pemData == null || pemData.trim().isEmpty()) {
-      return false;
-    }
-    
-    return PEM_CERT_PATTERN.matcher(pemData).find();
-  }
-
-  /**
-   * Validate PEM bundle format (may contain multiple certificates)
-   */
-  private boolean isValidPemBundle(String pemBundle) {
-    if (pemBundle == null || pemBundle.trim().isEmpty()) {
-      return false;
-    }
-    
-    // Check if it contains at least one valid PEM certificate
-    Matcher matcher = PEM_CERT_PATTERN.matcher(pemBundle);
-    return matcher.find();
-  }
-
-  /**
-   * Split a PEM bundle string into individual certificate PEM blocks.
-   */
-  private List<String> splitPemCertificates(String pemBundle) {
-    List<String> certs = new ArrayList<>();
-    if (pemBundle == null || pemBundle.trim().isEmpty()) return certs;
-
-    Matcher m = PEM_CERT_PATTERN.matcher(pemBundle);
-    while (m.find()) 
-    {
-      String block = m.group(0).trim();
-      if (!block.isEmpty()) certs.add(block);
-    }
-    return certs;
-  }
-
-  /**
-   * Enhanced local secret update with better error handling
-   */
-  private void updateLocalCaBundle( String caBundle ) 
+  private void updateLocalCaBundle(String caBundle)
   {
-    try 
+    try
     {
       LOGGER.info("Updating local CA bundle secret {}/{}", namespace, LOCAL_CA_SECRET_NAME);
 
-      // Validate bundle before updating
-      if (!isValidPemBundle(caBundle)) {
+      if (!isValidPemBundle(caBundle))
+      {
         LOGGER.error("Cannot update local CA bundle: invalid PEM format");
         throw new RuntimeException("Invalid PEM format in CA bundle");
       }
 
       Secret secret = kubeClient.secrets().inNamespace(namespace).withName(LOCAL_CA_SECRET_NAME).get();
 
-      if( secret == null ) 
+      if (secret == null)
       {
         LOGGER.warn("CA bundle secret {} not found in namespace {} - creating new secret",
-                    LOCAL_CA_SECRET_NAME, namespace);
+          LOCAL_CA_SECRET_NAME, namespace);
 
         Secret newSecret = new SecretBuilder()
           .withNewMetadata()
@@ -673,56 +949,60 @@ public class CaRotatorVert extends AbstractVerticle
           .addToStringData(LOCAL_CA_SECRET_KEY, caBundle)
           .build();
 
-        try 
+        try
         {
           kubeClient.secrets().inNamespace(namespace).resource(newSecret).create();
           LOGGER.info("Created new local CA bundle secret {}/{}", namespace, LOCAL_CA_SECRET_NAME);
-        } 
-        catch( KubernetesClientException kce ) 
+        }
+        catch (KubernetesClientException kce)
         {
-          if( kce.getCode() == 403 || (kce.getMessage() != null && kce.getMessage().toLowerCase().contains("forbidden"))) 
+          if (kce.getCode() == 403 || 
+              (kce.getMessage() != null && kce.getMessage().toLowerCase().contains("forbidden")))
           {
-            LOGGER.error("RBAC: insufficient permissions to create local secret '{}' in namespace '{}'. Grant create/patch/update on secrets to the rotator ServiceAccount. Error: {}",
-                         LOCAL_CA_SECRET_NAME, namespace, kce.getMessage());
-          } 
-          else 
+            LOGGER.error("RBAC: insufficient permissions to create local secret '{}' in namespace '{}'. " +
+              "Grant create/patch/update on secrets to the rotator ServiceAccount. Error: {}",
+              LOCAL_CA_SECRET_NAME, namespace, kce.getMessage());
+          }
+          else
           {
             LOGGER.error("Failed to create local secret {}: {}", LOCAL_CA_SECRET_NAME, kce.getMessage(), kce);
           }
           throw kce;
         }
-      } 
-      else 
+      }
+      else
       {
-        Secret updated = new SecretBuilder().withNewMetadata()
-                                            .withName(LOCAL_CA_SECRET_NAME)
-                                            .withNamespace(namespace)
-                                            .endMetadata()
-                                            .addToStringData(LOCAL_CA_SECRET_KEY, caBundle)
-                                            .build();
+        Secret updated = new SecretBuilder()
+          .withNewMetadata()
+            .withName(LOCAL_CA_SECRET_NAME)
+            .withNamespace(namespace)
+          .endMetadata()
+          .addToStringData(LOCAL_CA_SECRET_KEY, caBundle)
+          .build();
 
-        try 
+        try
         {
-          kubeClient.secrets().inNamespace(namespace).resource( updated ).serverSideApply();
+          kubeClient.secrets().inNamespace(namespace).resource(updated).serverSideApply();
           LOGGER.info("Replaced existing local CA bundle secret {}/{}", namespace, LOCAL_CA_SECRET_NAME);
         }
-        catch( KubernetesClientException kce ) 
+        catch (KubernetesClientException kce)
         {
-          if( kce.getCode() == 403 || (kce.getMessage() != null && kce.getMessage().toLowerCase().contains("forbidden")))
+          if (kce.getCode() == 403 || 
+              (kce.getMessage() != null && kce.getMessage().toLowerCase().contains("forbidden")))
           {
-            LOGGER.error( "RBAC: insufficient permissions to update local secret '{}' in namespace '{}'. Grant update/patch on secrets to the rotator ServiceAccount. Error: {}",
-                          LOCAL_CA_SECRET_NAME, namespace, kce.getMessage());
-          } 
-          else 
+            LOGGER.error("RBAC: insufficient permissions to update local secret '{}' in namespace '{}'. " +
+              "Grant update/patch on secrets to the rotator ServiceAccount. Error: {}",
+              LOCAL_CA_SECRET_NAME, namespace, kce.getMessage());
+          }
+          else
           {
             LOGGER.error("Failed to update local CA bundle: {}", kce.getMessage(), kce);
           }
           throw kce;
         }
       }
-
-    } 
-    catch( Exception e ) 
+    }
+    catch (Exception e)
     {
       LOGGER.error("Failed to update local CA bundle: {}", e.getMessage(), e);
       throw new RuntimeException("CA bundle update failed", e);
@@ -730,279 +1010,80 @@ public class CaRotatorVert extends AbstractVerticle
   }
 
   /**
-   * Enhanced local client notification with validation - Updated for NATS
-  private Future<Void> notifyLocalClientsWithValidation( String strBundle )
+   * Decode secret data from base64
+   */
+  private String decodeSecretData(String encodedData)
   {
-    return workerExecutor.executeBlocking( () -> {
-      // Validate bundle before updating anything
-      if( !isValidPemBundle( strBundle ) )
-      {
-        throw new RuntimeException( "Invalid PEM bundle format - cannot notify clients" );
-      }
-
-      // 1. Update Kubernetes secret (for other consumers/restarts)
-      updateLocalCaBundle( strBundle );
-      return null;
-    } ).compose( v -> {
-      // 2. Build CaBundle and notify NatsTLSClient with enhanced validation
-      if( natsTLSClient != null )
-      {
-        return buildCaBundle( "NATS", strBundle )
-          .compose( caBundle -> 
-           {  
-             // Enhanced rotation with connection pre-warming
-             return performEnhancedCARotation( caBundle, strBundle );
-           });
-      }
-      return Future.succeededFuture();
-    } );
-  }
-   */
-
-  /**
-   * Enhanced CA rotation that minimizes connection disruption - Updated for NATS
-  private Future<Void> performEnhancedCARotation( CaBundle caBundle, String strBundle )
-    LOGGER.info( "Starting enhanced CA rotation with connection pre-warming for NATS" );
-
-    return Future.succeededFuture().compose( v -> {
-      // Step 1: Pre-warm new connections with new CA (if client supports it)
-      try
-      {
-        boolean prewarmResult = false;
-        try
-        {
-          Future<Boolean> prewarmFuture = preWarmConnectionsWithNewCA( strBundle );  // Custom method for NATS
-          prewarmResult = prewarmFuture.toCompletionStage().toCompletableFuture().get( 5, TimeUnit.SECONDS );
-        } catch( Exception e )
-        {
-          LOGGER.error( "Pre-warming failed, continuing with direct update", e );
-          prewarmResult = false;
-        }
-
-        if( prewarmResult )
-        {
-          LOGGER.info( "Pre-warming connections with new CA bundle succeeded" );
-        } 
-        else
-        {
-          LOGGER.info( "Pre-warming connections with new CA bundle did not succeed or was skipped; proceeding with direct update" );
-        }
-
-        // Give pre-warming time to settle if desired
-//        return waitForProcessing( 3000 );
-      } catch( Exception e )
-      {
-        LOGGER.info( "Pre-warming failed, continuing with direct update", e );
-        return Future.succeededFuture();
-      }
-    } ).compose( v -> {
-      // Step 2: Update CA bundle on client
-      try
-      {
-        Future<Void> updateFuture = natsTLSClient.handleCaBundleUpdate( caBundle );
-        return updateFuture.recover( err -> {
-          String errorMessage = "Failed to update NatsTLSClient CA bundle: " + err.getMessage();
-          LOGGER.error( errorMessage, err );
-          return Future.failedFuture( "NatsTLSClient CA update failed: " + err.getMessage() );
-        } );
-      } catch( Exception e )
-      {
-        String errorMessage = "Failed to update NatsTLSClient CA bundle: " + e.getMessage();
-        LOGGER.error( errorMessage, e );
-        return Future.failedFuture( "NatsTLSClient CA update failed: " + e.getMessage() );
-      }
-    } ).compose( v -> {
-      // Step 3: Brief validation delay
-      return waitForProcessing( 2000 );
-    } ).compose( v -> {
-      // Step 4: Optional connection health check with better error handling
-      return performConnectionHealthCheck();
-    } );
-  }
-   */
-
-  /**
-   * Pre-warm connections with new CA bundle for NATS
-  private Future<Boolean> preWarmConnectionsWithNewCA(String caBundle) {
-    // This is a placeholder - implement according to your NATS client capabilities
-    // NATS may handle this differently than Pulsar
-    LOGGER.debug("NATS connection pre-warming not implemented, returning false");
-    return Future.succeededFuture(false);
-  }
-   */
-  
-  /**
-   * Simple connection health check for NATS
-  private Future<Void> performConnectionHealthCheck()
-  {
-    Promise<Void> promise = Promise.promise();
-
-    // 5 second timeout for health check
-    long timerId = vertx.setTimer( 5000, id -> 
-    {
-      LOGGER.debug( "Connection health check timed out - assuming success during rotation window" );
-      promise.tryComplete();
-    });
-
     try
     {
-      // Check if NATS client is healthy
-      boolean isHealthy = natsTLSClient.isHealthy();
-      vertx.cancelTimer( timerId );
+      byte[] decoded = Base64.getDecoder().decode(encodedData);
+      String result = new String(decoded, StandardCharsets.UTF_8);
       
-      if( isHealthy )
+      if (isValidPemBundle(result))
       {
-        LOGGER.info( "NATS connection health check passed" );
-        promise.tryComplete();
-      } 
+        return result;
+      }
       else
       {
-//        String message = "NATS connection health check failed, but continuing";
-        LOGGER.debug( "NATS connection health check returned false during rotation - this is expected" );
-        promise.tryComplete(); // Don't fail rotation for health check
+        LOGGER.warn("Decoded data is not valid PEM format");
+        return null;
       }
-    } 
-    catch( Exception e )
+    }
+    catch (Exception e)
     {
-      vertx.cancelTimer( timerId );
-      LOGGER.error( "Health check failed, continuing anyway", e );
-      promise.complete();
-    }
-
-    return promise.future();
-  }
- */
- 
-  /**
-   * Enhanced CA rotation event publishing with retry - Updated for NATS
-   */
-  private Future<String> publishCARotationEventWithRetry( String serverId, String caBundle, int attemptCount )
-  {
-    if (attemptCount >= MAX_ROTATION_RETRIES) {
-      return Future.failedFuture("Maximum publish attempts exceeded");
-    }
-
-    return generateSignedMessage( serverId, caBundle )
-      .compose( signedMsg ->
+      LOGGER.warn("Failed to decode secret data as Base64: {}", e.getMessage());
+      
+      if (isValidPemBundle(encodedData))
       {
-        try
-        {
-          byte[] signedBytes = SignedMessage.serialize( signedMsg );
-          if( signedBytes == null || signedBytes.length == 0 )
-          {
-            return Future.failedFuture( "Failed to serialize SignedMessage for CA bundle" );
-          }
-
-          return natsTLSClient.publish( ServiceCoreIF.MetaDataClientCaCertStream, signedBytes )  // Updated subject naming
-            .compose(v -> {
-              LOGGER.info( "Published SignedMessage for CA rotation event to NATS subject: {}", ServiceCoreIF.MetaDataClientCaCertStream );
-              return Future.succeededFuture("success");  // Return success indicator
-            });
-        }
-        catch( Exception e )
-        {
-          String errMsg = "Error publishing CaBundle. Error = " + e.getMessage();
-          LOGGER.error( errMsg, e );
-          return Future.failedFuture(errMsg);
-        }
-      })
-      .recover( err -> {
-        LOGGER.warn( "Failed to publish CA rotation event (attempt {}): {}", attemptCount + 1, err.getMessage() );
-        
-        if (attemptCount < MAX_ROTATION_RETRIES - 1) {
-          long retryDelayMs = 5000 * (attemptCount + 1); // Progressive delay
-          
-          Promise<String> retryPromise = Promise.promise();
-          vertx.setTimer(retryDelayMs, id -> {
-            LOGGER.info("Retrying CA rotation event publish (attempt {})", attemptCount + 2);
-            publishCARotationEventWithRetry(serverId, caBundle, attemptCount + 1)
-              .onComplete(retryPromise);
-          });
-          
-          return retryPromise.future();
-        } else {
-          return Future.failedFuture("Failed to publish CA rotation event after " + MAX_ROTATION_RETRIES + " attempts");
-        }
-      });
+        LOGGER.info("Data appears to already be in PEM format");
+        return encodedData;
+      }
+      
+      return null;
+    }
   }
 
   /**
-   * Generate SignedMessage for CA bundle
+   * Validate PEM bundle format
    */
-  private Future<SignedMessage> generateSignedMessage( String serverId, String caBundle )
+  private boolean isValidPemBundle(String pemData)
   {
-    LOGGER.info( "Generating CA Bundle SignedMessage for server: {}", serverId );
+    if (pemData == null || pemData.trim().isEmpty())
+    {
+      return false;
+    }
+    
+    return PEM_CERT_PATTERN.matcher(pemData).find();
+  }
 
-    return buildCaBundle( serverId, caBundle )
-      .compose( bundle ->
-        workerExecutor.executeBlocking( () ->
-        {
-          byte[] serializedBundle = CaBundle.serialize( bundle );
-          if( serializedBundle == null || serializedBundle.length == 0 )
-          {
-            throw new RuntimeException( "Failed to serialize CaBundle for server: " + serverId );
-          }
-          return serializedBundle;
-        })
-      )
-      .compose( serializedBundle ->
-        getMetadataSigningKey()
-          .compose( signKey ->
-            signer.sign( serializedBundle, signKey )
-              .compose( signature ->
-                workerExecutor.executeBlocking( () ->
-                {
-                  long keyEpoch = KeyEpochUtil.epochNumberForInstant( Instant.now() );
-                  List<TopicKey> keyList = keyCache.getValidTopicKeysSorted( ServiceCoreIF.MetaDataClientCaCertStream );  // Updated
-                  TopicKey topicKey = null;
+  /**
+   * Validate single PEM certificate
+   */
+  private boolean isValidPemCertificate(String pemData)
+  {
+    if (pemData == null || pemData.trim().isEmpty())
+    {
+      return false;
+    }
+    
+    return PEM_CERT_PATTERN.matcher(pemData).find();
+  }
 
-                  for( TopicKey key : keyList )
-                  {
-                    if( keyEpoch == key.getEpochNumber() )
-                    {
-                      topicKey = key;
-                      break;
-                    }
-                  }
+  /**
+   * Split PEM bundle into individual certificates
+   */
+  private List<String> splitPemCertificates(String pemBundle)
+  {
+    List<String> certs = new ArrayList<>();
+    if (pemBundle == null || pemBundle.trim().isEmpty()) return certs;
 
-                  if( topicKey == null )
-                  {
-                    String errMsg = "Generating SignedMessage process could not obtain an encryption key.";
-                    LOGGER.error( errMsg );
-                    throw new RuntimeException( errMsg );
-                  }
-
-                  EncryptedData encData = aesCrypto.encrypt( serializedBundle, topicKey.getKeyData() );
-                  if( encData == null || encData.getCiphertext() == null || encData.getCiphertext().length == 0 )
-                  {
-                    throw new RuntimeException( "Failed to encrypt CaBundle for server: " + serverId );
-                  }
-
-                  LOGGER.info( "Successfully generated and encrypted CaBundle for server: {}", serverId );
-
-                  Instant now      = Instant.now();
-                  long    caEpoch  = caEpochUtil.epochNumberForInstant(  now );
-
-                  return new SignedMessage( serverId + now.toString(),
-                      "CaBundle",
-                      caEpoch,
-                      keyEpoch,
-                      "metadata",
-                      signKey.getEpochNumber(),
-                      now,
-                      signature,
-                      ServiceCoreIF.MetaDataClientCaCertStream,
-                      topicKey.getKeyId(),
-                      "CaBundle",
-                      encData.serialize());
-                 })
-              )
-            )
-      )
-      .onFailure( err ->
-      {
-        LOGGER.error( "Failed to process CA Bundle for server: {}", serverId, err );
-      });
+    Matcher m = PEM_CERT_PATTERN.matcher(pemBundle);
+    while (m.find())
+    {
+      String block = m.group(0).trim();
+      if (!block.isEmpty()) certs.add(block);
+    }
+    return certs;
   }
 
   /**
@@ -1012,13 +1093,153 @@ public class CaRotatorVert extends AbstractVerticle
   {
     return workerExecutor.executeBlocking(() ->
     {
-      Instant timestamp  = Instant.now();
-      String  caVersion  = timestamp.toString();
-      long    caEpochNum = caEpochUtil.epochNumberForInstant( timestamp );
+      Instant timestamp = Instant.now();
+      String caVersion = timestamp.toString();
+      long caEpochNum = caEpochUtil.epochNumberForInstant(timestamp);
 
-      CaBundle bundle = new CaBundle( serverId, timestamp, caEpochNum, ServiceCoreIF.CaRotationEvent, caBundle, caVersion);
+      CaBundle bundle = new CaBundle(serverId, timestamp, caEpochNum, 
+        ServiceCoreIF.CaRotationEvent, caBundle, caVersion);
       return bundle;
     });
+  }
+
+  /**
+   * Enhanced CA rotation event publishing with retry
+   */
+  private Future<String> publishCARotationEventWithRetry(String serverId, String caBundle, int attemptCount)
+  {
+    if (attemptCount >= MAX_ROTATION_RETRIES)
+    {
+      return Future.failedFuture("Maximum publish attempts exceeded");
+    }
+
+    return generateSignedMessage(serverId, caBundle)
+      .compose(signedMsg ->
+      {
+        try
+        {
+          byte[] signedBytes = SignedMessage.serialize(signedMsg);
+          if (signedBytes == null || signedBytes.length == 0)
+          {
+            return Future.failedFuture("Failed to serialize SignedMessage for CA bundle");
+          }
+
+          return natsTLSClient.publish(ServiceCoreIF.MetaDataClientCaCertStream, signedBytes)
+            .compose(v -> {
+              LOGGER.info("Published SignedMessage for CA rotation event to NATS subject: {}", 
+                ServiceCoreIF.MetaDataClientCaCertStream);
+              return Future.succeededFuture("success");
+            });
+        }
+        catch (Exception e)
+        {
+          String errMsg = "Error publishing CaBundle. Error = " + e.getMessage();
+          LOGGER.error(errMsg, e);
+          return Future.failedFuture(errMsg);
+        }
+      })
+      .recover(err -> {
+        LOGGER.warn("Failed to publish CA rotation event (attempt {}): {}", attemptCount + 1, err.getMessage());
+        
+        if (attemptCount < MAX_ROTATION_RETRIES - 1)
+        {
+          long retryDelayMs = 5000 * (attemptCount + 1);
+          
+          Promise<String> retryPromise = Promise.promise();
+          vertx.setTimer(retryDelayMs, id -> {
+            LOGGER.info("Retrying CA rotation event publish (attempt {})", attemptCount + 2);
+            publishCARotationEventWithRetry(serverId, caBundle, attemptCount + 1)
+              .onComplete(retryPromise);
+          });
+          
+          return retryPromise.future();
+        }
+        else
+        {
+          return Future.failedFuture("Failed to publish CA rotation event after " + 
+            MAX_ROTATION_RETRIES + " attempts");
+        }
+      });
+  }
+
+  /**
+   * Generate SignedMessage for CA bundle
+   */
+  private Future<SignedMessage> generateSignedMessage(String serverId, String caBundle)
+  {
+    LOGGER.info("Generating CA Bundle SignedMessage for server: {}", serverId);
+
+    return buildCaBundle(serverId, caBundle)
+      .compose(bundle ->
+        workerExecutor.executeBlocking(() ->
+        {
+          byte[] serializedBundle = CaBundle.serialize(bundle);
+          if (serializedBundle == null || serializedBundle.length == 0)
+          {
+            throw new RuntimeException("Failed to serialize CaBundle for server: " + serverId);
+          }
+          return serializedBundle;
+        })
+      )
+      .compose(serializedBundle ->
+        getMetadataSigningKey()
+          .compose(signKey ->
+            signer.sign(serializedBundle, signKey)
+              .compose(signature ->
+                workerExecutor.executeBlocking(() ->
+                {
+                  long keyEpoch = KeyEpochUtil.epochNumberForInstant(Instant.now());
+                  List<TopicKey> keyList = keyCache.getValidTopicKeysSorted(
+                    ServiceCoreIF.MetaDataClientCaCertStream);
+                  TopicKey topicKey = null;
+
+                  for (TopicKey key : keyList)
+                  {
+                    if (keyEpoch == key.getEpochNumber())
+                    {
+                      topicKey = key;
+                      break;
+                    }
+                  }
+
+                  if (topicKey == null)
+                  {
+                    String errMsg = "Generating SignedMessage process could not obtain an encryption key.";
+                    LOGGER.error(errMsg);
+                    throw new RuntimeException(errMsg);
+                  }
+
+                  EncryptedData encData = aesCrypto.encrypt(serializedBundle, topicKey.getKeyData());
+                  if (encData == null || encData.getCiphertext() == null || encData.getCiphertext().length == 0)
+                  {
+                    throw new RuntimeException("Failed to encrypt CaBundle for server: " + serverId);
+                  }
+
+                  LOGGER.info("Successfully generated and encrypted CaBundle for server: {}", serverId);
+
+                  Instant now = Instant.now();
+                  long caEpoch = caEpochUtil.epochNumberForInstant(now);
+
+                  return new SignedMessage(serverId + now.toString(),
+                    "CaBundle",
+                    caEpoch,
+                    keyEpoch,
+                    "metadata",
+                    signKey.getEpochNumber(),
+                    now,
+                    signature,
+                    ServiceCoreIF.MetaDataClientCaCertStream,
+                    topicKey.getKeyId(),
+                    "CaBundle",
+                    encData.serialize());
+                })
+              )
+          )
+      )
+      .onFailure(err ->
+      {
+        LOGGER.error("Failed to process CA Bundle for server: {}", serverId, err);
+      });
   }
 
   /**
@@ -1026,22 +1247,26 @@ public class CaRotatorVert extends AbstractVerticle
    */
   public Future<DilithiumKey> getMetadataSigningKey()
   {
-    return vertx.eventBus().<Buffer> request( ServicesACLWatcherVert.METADATA__SIGNING_KEY_ADDR, "metadata" )
-      .compose( msg ->
+    return vertx.eventBus().<Buffer>request(ServicesACLWatcherVert.METADATA__SIGNING_KEY_ADDR, "metadata")
+      .compose(msg ->
       {
         try
         {
-          DilithiumKey key = DilithiumKey.deSerialize( msg.body().getBytes(), "transport" );
-          return Future.succeededFuture( key );
+          DilithiumKey key = DilithiumKey.deSerialize(msg.body().getBytes(), "transport");
+          return Future.succeededFuture(key);
         }
-        catch( Exception e )
+        catch (Exception e)
         {
-          return Future.failedFuture( e );
+          return Future.failedFuture(e);
         }
       });
   }
 
-  private Future<Void> waitForProcessing(long delayMs) {
+  /**
+   * Wait for processing delay
+   */
+  private Future<Void> waitForProcessing(long delayMs)
+  {
     Promise<Void> p = Promise.promise();
     vertx.setTimer(delayMs, id -> p.complete());
     return p.future();

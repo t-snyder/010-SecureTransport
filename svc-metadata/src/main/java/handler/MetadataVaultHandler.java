@@ -12,13 +12,12 @@ import java.io.ByteArrayInputStream;
 import java.security.MessageDigest;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -28,6 +27,7 @@ import org.slf4j.LoggerFactory;
 import core.handler.VaultAccessHandler;
 import core.model.CaBundle;
 import core.model.ServiceBundle;
+import core.utils.CAEpochUtil;
 
 /**
  * Specialized Vault handler for Metadata service operations. Pre-collects existing
@@ -285,6 +285,104 @@ public class MetadataVaultHandler
     });
   }
 
+  /**
+   * Generate a new internal key with unique name (no private key in memory)
+   */
+  public Future<String> generateNewKey(String pkiMount, String keyName, String keyType, int keyBits) {
+    String apiUrl = "/v1/" + pkiMount + "/keys/generate/internal";
+    
+    JsonObject payload = new JsonObject()
+      .put("key_type", keyType)
+      .put("key_bits", keyBits)
+      .put("key_name", keyName);
+    
+    LOGGER.info("Generating new internal key: {} in mount {}", keyName, pkiMount);
+    
+    return vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
+      .map(response -> {
+        JsonObject data = response.getJsonObject("data");
+        if (data == null || !data.containsKey("key_id")) {
+          throw new IllegalStateException("Invalid response: missing key_id");
+        }
+        
+        String keyId = data.getString("key_id");
+        String assignedKeyName = data.getString("key_name", keyName);
+        
+        LOGGER.info("Generated new key: id={}, name={}", keyId, assignedKeyName);
+        return keyId;
+      });
+  }
+ 
+  /**
+   * Generate NEW key AND CSR in one operation (ALTERNATIVE APPROACH)
+   */
+  public Future<CsrWithKeyId> generateNewKeyAndCsr(
+      String pkiMount, 
+      String commonName,
+      String keyName,
+      String keyType, 
+      int keyBits) {
+    
+    String apiUrl = "/v1/" + pkiMount + "/issuers/generate/intermediate/internal";
+
+    JsonObject payload = new JsonObject()
+      .put("common_name", commonName)
+      .put("key_type", keyType)
+      .put("key_bits", keyBits)
+      .put("key_name", keyName);  // Generate new key with this name
+
+    LOGGER.info("Generating NEW key '{}' and intermediate CSR in one operation", keyName);
+
+    return vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
+      .map(response -> {
+        JsonObject data = response.getJsonObject("data");
+        if (data == null || !data.containsKey("csr")) {
+          throw new IllegalStateException("Invalid response: missing CSR");
+        }
+
+        String csr = data.getString("csr");
+        String keyId = data.getString("key_id");
+        String assignedKeyName = data.getString("key_name", keyName);
+        
+        LOGGER.info("Generated NEW key and CSR (key_id: {}, key_name: {})", keyId, assignedKeyName);
+        
+        return new CsrWithKeyId(csr, keyId);
+      });
+  }
+  
+  /**
+   * Generate intermediate CSR using a specific key reference
+   */
+  public Future<CsrWithKeyId> generateIntermediateCsrWithKeyRef(
+      String pkiMount, 
+      String commonName, 
+      String keyRef) {
+    
+    String apiUrl = "/v1/" + pkiMount + "/intermediate/generate/internal";
+
+    JsonObject payload = new JsonObject()
+      .put("common_name", commonName)
+      .put("key_ref", keyRef);  // Reference the specific key to use
+
+    LOGGER.info("Generating intermediate CSR with key_ref: {}", keyRef);
+
+    return vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
+      .map(response -> {
+        JsonObject data = response.getJsonObject("data");
+        if (data == null || !data.containsKey("csr")) {
+          throw new IllegalStateException("Invalid response: missing CSR");
+        }
+
+        String csr = data.getString("csr");
+        String keyId = data.getString("key_id");
+        
+        LOGGER.info("Generated CSR with existing key (key_id: {})", keyId);
+        
+        return new CsrWithKeyId(csr, keyId);
+      });
+  }
+
+/**  
   public Future<CsrWithKeyId> generateIntermediateCsrInternal(String pkiMount, String commonName, String keyType, int keyBits) {
     String apiUrl = "/v1/" + pkiMount + "/intermediate/generate/internal";
 
@@ -311,7 +409,8 @@ public class MetadataVaultHandler
             return new CsrWithKeyId(csr, keyId);
         });
   }  
-
+*/
+  
   public Future<String> signCsrWithRoot( String rootPkiPath, String csr, String ttl )
   {
     String apiUrl = "/v1/" + rootPkiPath + "/root/sign-intermediate";
@@ -338,9 +437,406 @@ public class MetadataVaultHandler
 
   /**
    * Install the signed intermediate certificate into the intermediate mount.
+   * ENHANCED: Uses multiple detection methods with detailed logging to track which method succeeds.
    * Returns the issuerId if it can be discovered OR null if the endpoint is unavailable or issuer can't be determined.
    * Does not fail the rotation for 404/permission errors on set-signed; returns succeededFuture(null) in that case.
    */
+  public Future<String> setIntermediateSignedCertificateInternal(String intermediateMount, String signedCertificate) {
+    String apiUrl = "/v1/" + intermediateMount + "/intermediate/set-signed";
+    JsonObject payload = new JsonObject().put("certificate", signedCertificate);
+
+    LOGGER.info("Installing signed intermediate into mount {} via {}", intermediateMount, apiUrl);
+
+    // Extract certificate fingerprint BEFORE setting it for reliable matching
+    String certFingerprint;
+    try {
+      certFingerprint = fingerprintSha256FromPem(signedCertificate);
+      if (certFingerprint != null) {
+        LOGGER.debug("Certificate fingerprint for matching: {}...", certFingerprint.substring(0, 16));
+      }
+    } catch (Exception e) {
+      LOGGER.warn("Failed to extract certificate fingerprint, will use fallback matching: {}", e.getMessage());
+      certFingerprint = null;
+    }
+
+    final String targetFingerprint = certFingerprint;
+
+    return vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
+      .recover(err -> {
+        // Treat not-found/forbidden as non-fatal: return null issuerId
+        String msg = err.getMessage() != null ? err.getMessage().toLowerCase() : "";
+        if (msg.contains("404") || msg.contains("not found") || msg.contains("permission") || msg.contains("forbidden")) {
+          LOGGER.warn("intermediate/set-signed not available or allowed on mount {}: {}; returning null issuerId (non-fatal)", intermediateMount, err.getMessage());
+          return Future.succeededFuture(new JsonObject().put("not_supported", true));
+        }
+        return Future.failedFuture(err);
+      })
+      .compose(resp -> {
+        // If we turned a 404/forbidden into an object with not_supported, return null
+        if (resp == null || (resp.containsKey("not_supported") && resp.getBoolean("not_supported"))) {
+          LOGGER.info("🔍 Issuer Detection Method: UNAVAILABLE (set-signed endpoint not supported)");
+          return Future.succeededFuture((String) null);
+        }
+
+        // Check if response directly contains issuer ID
+        JsonObject data = resp.getJsonObject("data");
+        if (data != null) {
+          // Try imported_issuers array first
+          if (data.containsKey("imported_issuers")) {
+            JsonArray imported = data.getJsonArray("imported_issuers");
+            if (imported != null && imported.size() > 0) {
+              String issuerId = imported.getString(0);
+              LOGGER.info("✅ Issuer Detection Method: DIRECT_RESPONSE (imported_issuers field)");
+              LOGGER.info("Found issuer ID from imported_issuers: {}", issuerId);
+              return Future.succeededFuture(issuerId);
+            }
+          }
+          // Try issuer_id field
+          if (data.containsKey("issuer_id")) {
+            String issuerId = data.getString("issuer_id");
+            LOGGER.info("✅ Issuer Detection Method: DIRECT_RESPONSE (issuer_id field)");
+            LOGGER.info("Found issuer ID from issuer_id field: {}", issuerId);
+            return Future.succeededFuture(issuerId);
+          }
+        }
+
+        LOGGER.info("🔍 No issuer ID in set-signed response, waiting before catalog query...");
+        
+        // No direct issuer ID in response - wait for Vault's internal indexes to update
+        return waitForProcessing(2500)  // Increased from 1500ms to 2500ms
+          .compose(v -> {
+            // Use fingerprint matching if available (most reliable)
+            if (targetFingerprint != null) {
+              LOGGER.info("🔍 Attempting issuer detection via FINGERPRINT_MATCHING...");
+              Promise<String> fingerprintPromise = Promise.promise();
+              findIssuerByFingerprint(intermediateMount, signedCertificate, targetFingerprint, 
+                                     1, 12, 1000L, fingerprintPromise);
+              return fingerprintPromise.future();
+            } else {
+              // Fallback to original name-based matching
+              LOGGER.info("🔍 Attempting issuer detection via NAME_MATCHING (fallback)...");
+              Promise<String> fallbackPromise = Promise.promise();
+              attemptFindIssuerId(intermediateMount, signedCertificate, 1, 8, 1000L, fallbackPromise);
+              return fallbackPromise.future();
+            }
+          });
+      });
+  }
+
+  /**
+   * Find issuer by matching certificate fingerprint - more reliable than name/time matching
+   */
+  private void findIssuerByFingerprint(String mount, String signedCert, String targetFingerprint, 
+                                       int attempt, int maxAttempts, long backoffMillis, 
+                                       Promise<String> promise) {
+    listPkiIssuerIds(mount).onComplete(listAr -> {
+      if (listAr.failed()) {
+        if (attempt < maxAttempts) {
+          long next = Math.min(backoffMillis * 2, 10000L);  // Increased max to 10 seconds
+          LOGGER.debug("listPkiIssuerIds failed attempt {}/{}: {}; retrying in {}ms", 
+                      attempt, maxAttempts, listAr.cause().getMessage(), next);
+          vertx.setTimer(next, id -> findIssuerByFingerprint(mount, signedCert, targetFingerprint, 
+                                                             attempt + 1, maxAttempts, backoffMillis, promise));
+        } else {
+          LOGGER.warn("⚠️ Issuer Detection: listPkiIssuerIds failed after {} attempts, falling back to name matching", maxAttempts);
+          attemptFindIssuerId(mount, signedCert, 1, 8, 1000L, promise);
+        }
+        return;
+      }
+
+      List<String> ids = listAr.result();
+      if (ids == null || ids.isEmpty()) {
+        if (attempt < maxAttempts) {
+          long next = Math.min(backoffMillis * 2, 10000L);
+          LOGGER.debug("No issuers found yet (attempt {}/{}), retrying in {}ms", attempt, maxAttempts, next);
+          vertx.setTimer(next, id -> findIssuerByFingerprint(mount, signedCert, targetFingerprint, 
+                                                             attempt + 1, maxAttempts, backoffMillis, promise));
+        } else {
+          LOGGER.warn("⚠️ Issuer Detection: No issuers found after {} attempts", maxAttempts);
+          promise.complete(null);
+        }
+        return;
+      }
+
+      LOGGER.debug("Checking {} issuers for fingerprint match (attempt {}/{})", ids.size(), attempt, maxAttempts);
+
+      // Get PEM for each issuer and check fingerprint
+      List<Future<String>> pemFutures = new ArrayList<>();
+      for (String id : ids) {
+        pemFutures.add(getIssuerCertificateViaPem(mount, id).recover(e -> Future.succeededFuture("")));
+      }
+
+      aggregateResults(pemFutures).onComplete(pemAll -> {
+        if (pemAll.succeeded()) {
+          List<String> pems = pemAll.result();
+          for (int i = 0; i < ids.size(); i++) {
+            String pem = pems.get(i);
+            if (pem == null || pem.isBlank()) continue;
+            
+            String fp = fingerprintSha256FromPem(pem);
+            if (fp != null && fp.equals(targetFingerprint)) {
+              LOGGER.info("✅ Issuer Detection Method: FINGERPRINT_MATCHING (PEM endpoint)");
+              LOGGER.info("Found matching issuer by fingerprint: {} (attempt {})", ids.get(i), attempt);
+              promise.complete(ids.get(i));
+              return;
+            }
+          }
+        }
+
+        // No fingerprint match found in PEM endpoints - try info endpoint fallback
+        LOGGER.debug("No fingerprint match in PEM endpoints, trying issuer info endpoint");
+        List<Future<JsonObject>> infoFutures = new ArrayList<>();
+        for (String id : ids) {
+          infoFutures.add(getIssuerInfo(mount, id).recover(e -> Future.succeededFuture(new JsonObject())));
+        }
+
+        aggregateResults(infoFutures).onComplete(infoAll -> {
+          if (infoAll.succeeded()) {
+            List<JsonObject> infos = infoAll.result();
+            for (int i = 0; i < ids.size(); i++) {
+              JsonObject info = infos.get(i);
+              if (info == null) continue;
+              
+              JsonObject data = info.getJsonObject("data", new JsonObject());
+              String cert = data.getString("certificate", null);
+              if (cert != null) {
+                String cfp = fingerprintSha256FromPem(cert);
+                if (cfp != null && cfp.equals(targetFingerprint)) {
+                  LOGGER.info("✅ Issuer Detection Method: FINGERPRINT_MATCHING (info endpoint certificate field)");
+                  LOGGER.info("Found matching issuer via info endpoint: {} (attempt {})", ids.get(i), attempt);
+                  promise.complete(ids.get(i));
+                  return;
+                }
+              }
+
+              // Check ca_chain array
+              if (data.containsKey("ca_chain")) {
+                JsonArray arr = data.getJsonArray("ca_chain");
+                if (arr != null) {
+                  for (int x = 0; x < arr.size(); x++) {
+                    String entry = arr.getString(x);
+                    String efp = fingerprintSha256FromPem(entry);
+                    if (efp != null && efp.equals(targetFingerprint)) {
+                      LOGGER.info("✅ Issuer Detection Method: FINGERPRINT_MATCHING (info endpoint ca_chain array)");
+                      LOGGER.info("Found matching issuer in ca_chain: {} (attempt {})", ids.get(i), attempt);
+                      promise.complete(ids.get(i));
+                      return;
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // Still no match - retry or give up
+          if (attempt < maxAttempts) {
+            long next = Math.min(backoffMillis * 2, 10000L);
+            LOGGER.debug("No fingerprint match found, retrying in {}ms (attempt {}/{})", next, attempt, maxAttempts);
+            vertx.setTimer(next, id -> findIssuerByFingerprint(mount, signedCert, targetFingerprint, 
+                                                               attempt + 1, maxAttempts, backoffMillis, promise));
+          } else {
+            LOGGER.warn("⚠️ Issuer Detection: Could not locate issuer by fingerprint after {} attempts; returning null", maxAttempts);
+            promise.complete(null);
+          }
+        });
+      });
+    });
+  }
+
+  /**
+   * Recursive retry helper to find issuer id after set-signed using name/content matching
+   */
+  private void attemptFindIssuerId(String mount, String signedCert, int attempt, int maxAttempts, long backoffMillis, Promise<String> promise) {
+    // Get issuer ids
+    listPkiIssuerIds(mount).onComplete(listAr -> {
+      if (listAr.failed()) {
+        if (attempt < maxAttempts) {
+          long next = Math.min(backoffMillis * 2, 5000L);
+          LOGGER.debug("listPkiIssuerIds failed on attempt {}/{}: {}; retrying", attempt, maxAttempts, listAr.cause().getMessage());
+          vertx.setTimer(next, id -> attemptFindIssuerId(mount, signedCert, attempt + 1, maxAttempts, backoffMillis, promise));
+        } else {
+          LOGGER.warn("⚠️ Issuer Detection: listPkiIssuerIds permanently failed after {} attempts: {}; returning null", maxAttempts, listAr.cause().getMessage());
+          promise.complete((String) null);
+        }
+        return;
+      }
+
+      List<String> ids = listAr.result();
+      if (ids == null || ids.isEmpty()) {
+        if (attempt < maxAttempts) {
+          long next = Math.min(backoffMillis * 2, 5000L);
+          LOGGER.debug("No issuers found yet (attempt {}/{}), retrying in {}ms", attempt, maxAttempts, next);
+          vertx.setTimer(next, id -> attemptFindIssuerId(mount, signedCert, attempt + 1, maxAttempts, backoffMillis, promise));
+        } else {
+          LOGGER.warn("⚠️ Issuer Detection: No issuers found after {} attempts", maxAttempts);
+          promise.complete((String) null);
+        }
+        return;
+      }
+
+      // Try PEM endpoints in parallel (fallback to empty string)
+      List<Future<?>> pemFutures = ids.stream()
+        .map(id -> getIssuerCertificateViaPem(mount, id).recover(e -> Future.succeededFuture("")))
+        .collect(Collectors.toList());
+
+      Future.all(pemFutures).onComplete(pemAll -> {
+        if (pemAll.succeeded()) {
+          CompositeFuture cf = pemAll.result();
+          List<Object> pems = cf.list();
+          for (int i = 0; i < pems.size(); i++) {
+            String pem = (String) pems.get(i);
+            if (pem != null && pem.trim().equals(signedCert.trim())) {
+              LOGGER.info("✅ Issuer Detection Method: NAME_MATCHING (PEM exact match)");
+              LOGGER.info("Found issuer ID via PEM exact match: {} (attempt {})", ids.get(i), attempt);
+              promise.complete(ids.get(i));
+              return;
+            }
+          }
+        } else {
+          LOGGER.debug("PEM endpoints composite failed (will try info fallback): {}", pemAll.cause().getMessage());
+        }
+
+        // Fallback: fetch issuer info for each issuer and inspect certificate fields
+        List<Future<?>> infoFutures = ids.stream()
+          .map(id -> getIssuerInfo(mount, id).recover(e -> Future.succeededFuture(new JsonObject())))
+          .collect(Collectors.toList());
+
+        Future.all(infoFutures).onComplete(infoAll -> {
+          if (infoAll.succeeded()) {
+            CompositeFuture cf2 = infoAll.result();
+            List<Object> infos = cf2.list();
+            for (int i = 0; i < infos.size(); i++) {
+              JsonObject info = (JsonObject) infos.get(i);
+              if (info != null) {
+                JsonObject data = info.getJsonObject("data", new JsonObject());
+                String cert = data.getString("certificate", null);
+                if (cert != null && cert.trim().equals(signedCert.trim())) {
+                  LOGGER.info("✅ Issuer Detection Method: NAME_MATCHING (info endpoint certificate field)");
+                  LOGGER.info("Found issuer ID via info certificate match: {} (attempt {})", ids.get(i), attempt);
+                  promise.complete(ids.get(i));
+                  return;
+                }
+                if (data.containsKey("ca_chain")) {
+                  JsonArray arr = data.getJsonArray("ca_chain");
+                  if (arr != null) {
+                    for (int x = 0; x < arr.size(); x++) {
+                      String entry = arr.getString(x);
+                      if (entry != null && entry.trim().equals(signedCert.trim())) {
+                        LOGGER.info("✅ Issuer Detection Method: NAME_MATCHING (info endpoint ca_chain array)");
+                        LOGGER.info("Found issuer ID via info ca_chain match: {} (attempt {})", ids.get(i), attempt);
+                        promise.complete(ids.get(i));
+                        return;
+                      }
+                   }
+                  }
+                }
+              }
+            }
+            // Not found in info fallback
+            if (attempt < maxAttempts) {
+              long next = Math.min(backoffMillis * 2, 5000L);
+              LOGGER.debug("No name match found, retrying in {}ms (attempt {}/{})", next, attempt, maxAttempts);
+              vertx.setTimer(next, id -> attemptFindIssuerId(mount, signedCert, attempt + 1, maxAttempts, backoffMillis, promise));
+            } else {
+              LOGGER.warn("⚠️ Issuer Detection: Could not locate issuer id for new signed intermediate after {} attempts; returning null", maxAttempts);
+              promise.complete((String) null);
+            }
+          } else {
+            // info listing failed
+            if (attempt < maxAttempts) {
+              long next = Math.min(backoffMillis * 2, 5000L);
+              LOGGER.debug("Issuer info fetch failed on attempt {}/{}: {}; retrying", attempt, maxAttempts, infoAll.cause().getMessage());
+              vertx.setTimer(next, id -> attemptFindIssuerId(mount, signedCert, attempt + 1, maxAttempts, backoffMillis, promise));
+            } else {
+              LOGGER.warn("⚠️ Issuer Detection: Issuer info permanently failed after {} attempts: {}; returning null", maxAttempts, infoAll.cause().getMessage());
+              promise.complete((String) null);
+            }
+          }
+        });
+      });
+    });
+  }
+  
+  /**
+   * Install the signed intermediate certificate into the intermediate mount.
+   * ENHANCED: Uses certificate fingerprint matching for reliable issuer detection.
+   * Returns the issuerId if it can be discovered OR null if the endpoint is unavailable or issuer can't be determined.
+   * Does not fail the rotation for 404/permission errors on set-signed; returns succeededFuture(null) in that case.
+  public Future<String> setIntermediateSignedCertificateInternal(String intermediateMount, String signedCertificate) {
+    String apiUrl = "/v1/" + intermediateMount + "/intermediate/set-signed";
+    JsonObject payload = new JsonObject().put("certificate", signedCertificate);
+
+    LOGGER.info("Installing signed intermediate into mount {} via {}", intermediateMount, apiUrl);
+
+    // Extract certificate fingerprint BEFORE setting it for reliable matching
+    String certFingerprint;
+    try {
+      certFingerprint = fingerprintSha256FromPem(signedCertificate);
+      if (certFingerprint != null) {
+        LOGGER.debug("Certificate fingerprint for matching: {}...", certFingerprint.substring(0, 16));
+      }
+    } catch (Exception e) {
+      LOGGER.warn("Failed to extract certificate fingerprint, will use fallback matching: {}", e.getMessage());
+      certFingerprint = null;
+    }
+
+    final String targetFingerprint = certFingerprint;
+
+    return vaultHandler.vaultRequest("POST", apiUrl, payload.encode())
+      .recover(err -> {
+        // Treat not-found/forbidden as non-fatal: return null issuerId
+        String msg = err.getMessage() != null ? err.getMessage().toLowerCase() : "";
+        if (msg.contains("404") || msg.contains("not found") || msg.contains("permission") || msg.contains("forbidden")) {
+          LOGGER.warn("intermediate/set-signed not available or allowed on mount {}: {}; returning null issuerId (non-fatal)", intermediateMount, err.getMessage());
+          return Future.succeededFuture(new JsonObject().put("not_supported", true));
+        }
+        return Future.failedFuture(err);
+      })
+      .compose(resp -> {
+        // If we turned a 404/forbidden into an object with not_supported, return null
+        if (resp == null || (resp.containsKey("not_supported") && resp.getBoolean("not_supported"))) {
+          return Future.succeededFuture((String) null);
+        }
+
+        // Check if response directly contains issuer ID
+        JsonObject data = resp.getJsonObject("data");
+        if (data != null) {
+          // Try imported_issuers array first
+          if (data.containsKey("imported_issuers")) {
+            JsonArray imported = data.getJsonArray("imported_issuers");
+            if (imported != null && imported.size() > 0) {
+              String issuerId = imported.getString(0);
+              LOGGER.info("Got issuer ID from imported_issuers: {}", issuerId);
+              return Future.succeededFuture(issuerId);
+            }
+          }
+          // Try issuer_id field
+          if (data.containsKey("issuer_id")) {
+            String issuerId = data.getString("issuer_id");
+            LOGGER.info("Got issuer ID from issuer_id field: {}", issuerId);
+            return Future.succeededFuture(issuerId);
+          }
+        }
+
+        // No direct issuer ID in response - use fingerprint matching if available
+        if (targetFingerprint != null) {
+          Promise<String> fingerprintPromise = Promise.promise();
+          findIssuerByFingerprint(intermediateMount, signedCertificate, targetFingerprint, 1, 10, 500L, fingerprintPromise);
+          return fingerprintPromise.future();
+        } else {
+          // Fallback to original name-based matching
+          Promise<String> fallbackPromise = Promise.promise();
+          attemptFindIssuerId(intermediateMount, signedCertificate, 1, 5, 500L, fallbackPromise);
+          return fallbackPromise.future();
+        }
+      });
+  }
+   */
+  
+  /**
+   * Install the signed intermediate certificate into the intermediate mount.
+   * Returns the issuerId if it can be discovered OR null if the endpoint is unavailable or issuer can't be determined.
+   * Does not fail the rotation for 404/permission errors on set-signed; returns succeededFuture(null) in that case.
   public Future<String> setIntermediateSignedCertificateInternal(String intermediateMount, String signedCertificate) {
     String apiUrl = "/v1/" + intermediateMount + "/intermediate/set-signed";
     JsonObject payload = new JsonObject().put("certificate", signedCertificate);
@@ -369,7 +865,125 @@ public class MetadataVaultHandler
         return p.future();
       });
   }
+ */
 
+  /**
+   * Find issuer by matching certificate fingerprint - more reliable than name/time matching
+  private void findIssuerByFingerprint(String mount, String signedCert, String targetFingerprint, 
+                                       int attempt, int maxAttempts, long backoffMillis, 
+                                       Promise<String> promise) {
+    listPkiIssuerIds(mount).onComplete(listAr -> {
+      if (listAr.failed()) {
+        if (attempt < maxAttempts) {
+          long next = Math.min(backoffMillis * 2, 5000L);
+          LOGGER.debug("listPkiIssuerIds failed attempt {}/{}: {}; retrying in {}ms", 
+                      attempt, maxAttempts, listAr.cause().getMessage(), next);
+          vertx.setTimer(next, id -> findIssuerByFingerprint(mount, signedCert, targetFingerprint, 
+                                                             attempt + 1, maxAttempts, backoffMillis, promise));
+        } else {
+          LOGGER.warn("listPkiIssuerIds failed after {} attempts, falling back to name matching", maxAttempts);
+          attemptFindIssuerId(mount, signedCert, 1, 5, 500L, promise);
+        }
+        return;
+      }
+
+      List<String> ids = listAr.result();
+      if (ids == null || ids.isEmpty()) {
+        if (attempt < maxAttempts) {
+          long next = Math.min(backoffMillis * 2, 5000L);
+          vertx.setTimer(next, id -> findIssuerByFingerprint(mount, signedCert, targetFingerprint, 
+                                                             attempt + 1, maxAttempts, backoffMillis, promise));
+        } else {
+          LOGGER.warn("No issuers found after {} attempts", maxAttempts);
+          promise.complete(null);
+        }
+        return;
+      }
+
+      LOGGER.debug("Checking {} issuers for fingerprint match (attempt {}/{})", ids.size(), attempt, maxAttempts);
+
+      // Get PEM for each issuer and check fingerprint
+      List<Future<String>> pemFutures = new ArrayList<>();
+      for (String id : ids) {
+        pemFutures.add(getIssuerCertificateViaPem(mount, id).recover(e -> Future.succeededFuture("")));
+      }
+
+      aggregateResults(pemFutures).onComplete(pemAll -> {
+        if (pemAll.succeeded()) {
+          List<String> pems = pemAll.result();
+          for (int i = 0; i < ids.size(); i++) {
+            String pem = pems.get(i);
+            if (pem == null || pem.isBlank()) continue;
+            
+            String fp = fingerprintSha256FromPem(pem);
+            if (fp != null && fp.equals(targetFingerprint)) {
+              LOGGER.info("✅ Found matching issuer by fingerprint: {} (attempt {})", ids.get(i), attempt);
+              promise.complete(ids.get(i));
+              return;
+            }
+          }
+        }
+
+        // No fingerprint match found - try info endpoint fallback
+        LOGGER.debug("No fingerprint match in PEM endpoints, trying issuer info");
+        List<Future<JsonObject>> infoFutures = new ArrayList<>();
+        for (String id : ids) {
+          infoFutures.add(getIssuerInfo(mount, id).recover(e -> Future.succeededFuture(new JsonObject())));
+        }
+
+        aggregateResults(infoFutures).onComplete(infoAll -> {
+          if (infoAll.succeeded()) {
+            List<JsonObject> infos = infoAll.result();
+            for (int i = 0; i < ids.size(); i++) {
+              JsonObject info = infos.get(i);
+              if (info == null) continue;
+              
+              JsonObject data = info.getJsonObject("data", new JsonObject());
+              String cert = data.getString("certificate", null);
+              if (cert != null) {
+                String cfp = fingerprintSha256FromPem(cert);
+                if (cfp != null && cfp.equals(targetFingerprint)) {
+                  LOGGER.info("✅ Found matching issuer via info endpoint: {} (attempt {})", ids.get(i), attempt);
+                  promise.complete(ids.get(i));
+                  return;
+                }
+              }
+
+              // Check ca_chain array
+              if (data.containsKey("ca_chain")) {
+                JsonArray arr = data.getJsonArray("ca_chain");
+                if (arr != null) {
+                  for (int x = 0; x < arr.size(); x++) {
+                    String entry = arr.getString(x);
+                    String efp = fingerprintSha256FromPem(entry);
+                    if (efp != null && efp.equals(targetFingerprint)) {
+                      LOGGER.info("✅ Found matching issuer in ca_chain: {} (attempt {})", ids.get(i), attempt);
+                      promise.complete(ids.get(i));
+                      return;
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // Still no match - retry or give up
+          if (attempt < maxAttempts) {
+            long next = Math.min(backoffMillis * 2, 5000L);
+            LOGGER.debug("No fingerprint match found, retrying in {}ms (attempt {}/{})", next, attempt, maxAttempts);
+            vertx.setTimer(next, id -> findIssuerByFingerprint(mount, signedCert, targetFingerprint, 
+                                                               attempt + 1, maxAttempts, backoffMillis, promise));
+          } else {
+            LOGGER.warn("Could not locate issuer by fingerprint after {} attempts; returning null", maxAttempts);
+            promise.complete(null);
+          }
+        });
+      });
+    });
+  }
+   */
+
+/**  
   // Recursive retry helper to find issuer id after set-signed
   private void attemptFindIssuerId(String mount, String signedCert, int attempt, int maxAttempts, long backoffMillis, Promise<String> promise) {
     // Get issuer ids
@@ -468,6 +1082,7 @@ public class MetadataVaultHandler
       });
     });
   }
+*/
   
   /**
    * Enhanced getCAChain implementation:
@@ -562,7 +1177,6 @@ public class MetadataVaultHandler
 
   /**
    * Count certificates in PEM data
-   */
   private int countCertificatesInPem(String pemData) {
     if (pemData == null) return 0;
     
@@ -574,7 +1188,8 @@ public class MetadataVaultHandler
     }
     return count;
   }
-
+  */
+ 
   /** 
    * Store a ServiceBundle for a given serviceId and epoch.
    * Vault path: secret/data/service-bundles/{serviceId}/{epoch}
@@ -947,6 +1562,158 @@ public class MetadataVaultHandler
       });
   }
 
+  /**
+   * Prune expired issuers based on actual certificate expiration + grace period.
+   * This is more sophisticated than count-based pruning.
+   * 
+   * @param pkiMount The PKI mount to prune
+   * @param caEpochUtil Epoch utility for grace period calculations
+   * @return Future with count of deleted issuers
+   */
+  public Future<Integer> pruneExpiredIssuers(String pkiMount, CAEpochUtil caEpochUtil) {
+    LOGGER.info("Starting grace period-based issuer pruning for mount: {}", pkiMount);
+    
+    return listPkiIssuerIds(pkiMount)
+      .<Integer>compose(issuerIds -> {
+        if (issuerIds == null || issuerIds.isEmpty()) {
+          LOGGER.info("No issuers found in PKI mount {} for pruning", pkiMount);
+          return Future.succeededFuture(0);
+        }
+        
+        LOGGER.info("Analyzing {} issuers for expiration status", issuerIds.size());
+        
+        // Get expiry information for all issuers
+        List<Future<IssuerWithExpiry>> expiryFutures = issuerIds.stream()
+          .map(issuerId -> getIssuerExpiryInfo(pkiMount, issuerId))
+          .collect(Collectors.toList());
+        
+        return this.<IssuerWithExpiry>aggregateResults(expiryFutures)
+          .<Integer>compose(issuersWithExpiry -> {
+            Instant now = Instant.now();
+            Instant graceCutoff = now.minus(caEpochUtil.getGracePeriod());
+            
+            List<String> toDelete = new ArrayList<>();
+            List<String> inGracePeriod = new ArrayList<>();
+            List<String> stillValid = new ArrayList<>();
+            
+            for (IssuerWithExpiry issuer : issuersWithExpiry) {
+              if (issuer.getExpiry() == null) {
+                LOGGER.warn("Could not determine expiry for issuer {}, keeping it", issuer.getIssuerId());
+                stillValid.add(issuer.getIssuerId());
+                continue;
+              }
+              
+              if (issuer.getExpiry().isBefore(graceCutoff)) {
+                // Expired and past grace period - safe to delete
+                toDelete.add(issuer.getIssuerId());
+                LOGGER.info("Issuer {} marked for deletion (expired: {}, grace ended: {})",
+                  issuer.getIssuerId(), issuer.getExpiry(), graceCutoff);
+              } else if (issuer.getExpiry().isBefore(now)) {
+                // Expired but still in grace period
+                inGracePeriod.add(issuer.getIssuerId());
+                LOGGER.info("Issuer {} in grace period (expired: {}, grace until: {})",
+                  issuer.getIssuerId(), issuer.getExpiry(), issuer.getExpiry().plus(caEpochUtil.getGracePeriod()));
+              } else {
+                // Still valid
+                stillValid.add(issuer.getIssuerId());
+                LOGGER.debug("Issuer {} still valid (expires: {})",
+                  issuer.getIssuerId(), issuer.getExpiry());
+              }
+            }
+            
+            LOGGER.info("Pruning summary: {} to delete, {} in grace period, {} still valid",
+              toDelete.size(), inGracePeriod.size(), stillValid.size());
+            
+            if (toDelete.isEmpty()) {
+              return Future.succeededFuture(0);
+            }
+            
+            // Delete expired issuers
+            List<Future<Void>> deleteFutures = toDelete.stream()
+              .map(issuerId -> deleteIssuer(pkiMount, issuerId)
+                .recover(err -> {
+                  LOGGER.warn("Failed to delete issuer {} (continuing): {}", issuerId, err.getMessage());
+                  return Future.succeededFuture((Void) null);
+                }))
+              .collect(Collectors.toList());
+            
+            return Future.all(deleteFutures)
+              .<Integer>map(cf -> {
+                int deleted = toDelete.size();
+                LOGGER.info("Successfully pruned {} expired issuers from {}", deleted, pkiMount);
+                return deleted;
+              });
+          });
+      })
+      .recover(err -> {
+        LOGGER.error("Failed to prune expired issuers: {}", err.getMessage(), err);
+        return Future.succeededFuture(0);
+      });
+  }
+
+  /**
+   * Get issuer expiry information by parsing the certificate
+   */
+  private Future<IssuerWithExpiry> getIssuerExpiryInfo( String pkiMount, String issuerId )
+  {
+    return getIssuerCertificateViaPem( pkiMount, issuerId ).<IssuerWithExpiry> compose( pem -> {
+      Instant expiry = extractCertificateExpiry( pem );
+      return Future.succeededFuture( new IssuerWithExpiry( issuerId, expiry ) );
+    } ).recover( err -> {
+      LOGGER.debug( "Could not get PEM for issuer {}, trying info endpoint", issuerId );
+      return getIssuerCertificateViaInfo( pkiMount, issuerId ).<IssuerWithExpiry> compose( pem -> {
+        Instant expiry = extractCertificateExpiry( pem );
+        return Future.succeededFuture( new IssuerWithExpiry( issuerId, expiry ) );
+      } ).recover( err2 -> {
+        LOGGER.warn( "Could not determine expiry for issuer {}: {}", issuerId, err2.getMessage() );
+        return Future.succeededFuture( new IssuerWithExpiry( issuerId, null ) );
+      } );
+    } );
+  }
+  
+  /**
+   * Extract certificate expiry (NotAfter) from PEM data
+   */
+  private Instant extractCertificateExpiry( String pem )
+  {
+    if( pem == null || pem.isBlank() )
+    {
+      return null;
+    }
+
+    try
+    {
+      // Extract base64 content from PEM
+      String b64;
+      int beginIdx = pem.indexOf( "-----BEGIN CERTIFICATE-----" );
+      int endIdx = pem.indexOf( "-----END CERTIFICATE-----" );
+
+      if( beginIdx != -1 && endIdx != -1 && endIdx > beginIdx )
+      {
+        String block = pem.substring( beginIdx + "-----BEGIN CERTIFICATE-----".length(), endIdx );
+        b64 = block.replaceAll( "\\s+", "" );
+      }
+      else
+      {
+        b64 = pem.replaceAll( "\\s+", "" );
+      }
+
+      // Decode and parse X.509 certificate
+      byte[] der = Base64.getDecoder().decode( b64 );
+      CertificateFactory cf = CertificateFactory.getInstance( "X.509" );
+      X509Certificate cert = (X509Certificate)cf.generateCertificate( new ByteArrayInputStream( der ) );
+
+      Date notAfter = cert.getNotAfter();
+      return notAfter.toInstant();
+    }
+    catch( Exception e )
+    {
+      LOGGER.debug( "Failed to parse certificate expiry: {}", e.getMessage() );
+      return null;
+    }
+  }
+  
+/**
   public Future<Integer> pruneOldIssuers(String pkiMount, int keepLastN) {
     final int keep = Math.max(1, keepLastN); // effectively-final copy for use in lambdas
     Promise<Integer> p = Promise.promise();
@@ -987,31 +1754,41 @@ public class MetadataVaultHandler
 
     return p.future();
   }
-
-  private String fingerprintSha256FromPem(String pem) {
-    if (pem == null) return null;
-    try {
-        String b64;
-        int b = pem.indexOf("-----BEGIN CERTIFICATE-----");
-        int e = pem.indexOf("-----END CERTIFICATE-----");
-        if (b != -1 && e != -1 && e > b) {
-            String block = pem.substring(b + "-----BEGIN CERTIFICATE-----".length(), e);
-            b64 = block.replaceAll("\\s+", "");
-        } else {
-            b64 = pem.replaceAll("\\s+", "");
-        }
-        byte[] der = Base64.getDecoder().decode(b64);
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        byte[] digest = md.digest(der);
-        StringBuilder sb = new StringBuilder();
-        for (byte by : digest) sb.append(String.format("%02x", by & 0xff));
-        return sb.toString();
-    } catch (Exception ex) {
-        LOGGER.debug("fingerprint error: {}", ex.getMessage());
-        return null;
+*/
+  private String fingerprintSha256FromPem( String pem )
+  {
+    if( pem == null )
+      return null;
+    try
+    {
+      String b64;
+      int b = pem.indexOf( "-----BEGIN CERTIFICATE-----" );
+      int e = pem.indexOf( "-----END CERTIFICATE-----" );
+      if( b != -1 && e != -1 && e > b )
+      {
+        String block = pem.substring( b + "-----BEGIN CERTIFICATE-----".length(), e );
+        b64 = block.replaceAll( "\\s+", "" );
+      }
+      else
+      {
+        b64 = pem.replaceAll( "\\s+", "" );
+      }
+      byte[] der = Base64.getDecoder().decode( b64 );
+      MessageDigest md = MessageDigest.getInstance( "SHA-256" );
+      byte[] digest = md.digest( der );
+      StringBuilder sb = new StringBuilder();
+      for( byte by : digest )
+        sb.append( String.format( "%02x", by & 0xff ) );
+      return sb.toString();
+    }
+    catch( Exception ex )
+    {
+      LOGGER.debug( "fingerprint error: {}", ex.getMessage() );
+      return null;
     }
   }
 
+  /**
   private Date certificateNotBefore(String pem) {
     try {
         String b64;
@@ -1030,14 +1807,14 @@ public class MetadataVaultHandler
     } catch (Exception ignore) {
         return null;
     }
-}
-
+  }
+*/
+  
 /**
  * Find issuer id for a signed intermediate pem. Promise completes with the chosen issuer id or null.
  * - mount: "pulsar_int"
  * - signedPem: the PEM you posted to intermediate/set-signed
  * - attempt/backoff flow is internal (start attempt=1, maxAttempts=8, backoffMillis=500)
- */
   private void findIssuerIdForSignedCert(String mount, String signedPem, Promise<String> promise) {
     final int    maxAttempts    = 8;
     final long   initialBackoff = 500L;
@@ -1230,31 +2007,39 @@ public class MetadataVaultHandler
 
     new TryFind().run(1, initialBackoff);
   }
+ */
 
-  // Manual aggregator for a list of futures -> Future<List<T>> (works with Vert.x 5.0)
-  private <T> Future<List<T>> aggregateResults(List<Future<T>> futures) {
-    if (futures == null || futures.isEmpty()) {
-        return Future.succeededFuture(Collections.emptyList());
+  // Manual aggregator for a list of futures -> Future<List<T>> (works with
+  // Vert.x 5.0)
+  private <T> Future<List<T>> aggregateResults( List<Future<T>> futures )
+  {
+    if( futures == null || futures.isEmpty() )
+    {
+      return Future.succeededFuture( Collections.emptyList() );
     }
     Promise<List<T>> agg = Promise.promise();
-    List<T> results = new ArrayList<>(Collections.nCopies(futures.size(), null));
-    AtomicInteger remaining = new AtomicInteger(futures.size());
-    for (int i = 0; i < futures.size(); i++) {
-        final int idx = i;
-        futures.get(i).onComplete(ar -> {
-            if (ar.succeeded()) {
-                results.set(idx, ar.result());
-            } else {
-                results.set(idx, null);
-            }
-            if (remaining.decrementAndGet() == 0) {
-                agg.complete(results);
-            }
-        });
+    List<T> results = new ArrayList<>( Collections.nCopies( futures.size(), null ) );
+    AtomicInteger remaining = new AtomicInteger( futures.size() );
+    for( int i = 0; i < futures.size(); i++ )
+    {
+      final int idx = i;
+      futures.get( i ).onComplete( ar -> {
+        if( ar.succeeded() )
+        {
+          results.set( idx, ar.result() );
+        }
+        else
+        {
+          results.set( idx, null );
+        }
+        if( remaining.decrementAndGet() == 0 )
+        {
+          agg.complete( results );
+        }
+      } );
     }
     return agg.future();
   }
-
 
   /*****************************************************************************/
   /* Cleanup */
@@ -1271,6 +2056,31 @@ public class MetadataVaultHandler
   
   /*****************************************************************************/
   /* DTOs */
+
+  /**
+   * DTO for issuer with expiry information
+   */
+  public static class IssuerWithExpiry
+  {
+    private final String issuerId;
+    private final Instant expiry;
+
+    public IssuerWithExpiry( String issuerId, Instant expiry )
+    {
+      this.issuerId = issuerId;
+      this.expiry = expiry;
+    }
+
+    public String getIssuerId()
+    {
+      return issuerId;
+    }
+
+    public Instant getExpiry()
+    {
+      return expiry;
+    }
+  }
 
   public static class CsrWithKeyId {
       private final String csr;

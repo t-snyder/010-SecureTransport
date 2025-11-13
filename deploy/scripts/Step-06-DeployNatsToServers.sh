@@ -449,40 +449,6 @@ run_nats_cmd "nats stream add METADATA_CA_CLIENT \
   --deny-purge \
   --defaults" || echo 'Stream METADATA_CA_CLIENT may already exist'
 
-#echo "Creating stream METADATA_SERVICE_BUNDLE..."
-#run_nats_cmd "nats stream add METADATA_SERVICE_BUNDLE \
-#  --server=tls://${NATS_SERVICE}:4222 \
-#  --tlscert=/etc/nats-client-tls-certs/tls.crt \
-#  --tlskey=/etc/nats-client-tls-certs/tls.key \
-#  --tlsca=/etc/nats-ca-certs/ca.crt \
-#  --subjects='metadata.service-bundle.>' \
-#  --storage=file \
-#  --retention=limits \
-#  --discard=old \
-#  --replicas=3 \
-#  --max-age=2h \
-#  --no-allow-rollup \
-#  --deny-delete \
-#  --deny-purge \
-#  --defaults" || echo 'Stream METADATA_SERVICE_BUNDLE may already exist'
-
-#echo "Creating stream METADATA_BUNDLE_PUSH..."
-#run_nats_cmd "nats stream add METADATA_BUNDLE_PUSH \
-#  --server=tls://${NATS_SERVICE}:4222 \
-#  --tlscert=/etc/nats-client-tls-certs/tls.crt \
-#  --tlskey=/etc/nats-client-tls-certs/tls.key \
-#  --tlsca=/etc/nats-ca-certs/ca.crt \
-#  --subjects='metadata.bundle-push.>' \
-#  --storage=file \
-#  --retention=limits \
-#  --discard=old \
-#  --replicas=3 \
-#  --max-age=6h \
-#  --no-allow-rollup \
-#  --deny-delete \
-#  --deny-purge \
-#  --defaults" || echo 'Stream METADATA_BUNDLE_PUSH may already exist'
-
 echo "Creating stream AUTH_STREAM..."
 run_nats_cmd "nats stream add AUTH_STREAM \
   --server=tls://${NATS_SERVICE}:4222 \
@@ -580,24 +546,8 @@ add_pull_consumer "KEY_EXCHANGE" "metadata-key-exchange-watcher"        "metadat
 add_pull_consumer "KEY_EXCHANGE" "metadata-key-exchange-authcontroller" "metadata.key-exchange.authcontroller"
 add_pull_consumer "KEY_EXCHANGE" "metadata-key-exchange-gatekeeper"     "metadata.key-exchange.gatekeeper"
 
-# METADATA_BUNDLE_PUSH consumers (PULL based)
-#echo "=== METADATA_SERVICE_BUNDLE consumers ==="
-#add_pull_consumer "METADATA_SERVICE_BUNDLE" "metadata-service-bundle-watcher"        "metadata.service-bundle.svc-watcher"
-#add_pull_consumer "METADATA_SERVICE_BUNDLE" "metadata-service-bundle-tester"         "metadata.service-bundle.svc-tester"
-#add_pull_consumer "METADATA_SERVICE_BUNDLE" "metadata-service-bundle-authcontroller" "metadata.service-bundle.svc-authcontroller"
-#add_pull_consumer "METADATA_SERVICE_BUNDLE" "metadata-service-bundle-gatekeeper"     "metadata.service-bundle.svc-gatekeeper"
-
-# METADATA_BUNDLE_PULL consumers (PULL based)
-#echo "=== METADATA_BUNDLE_PULL consumers ==="
-#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-watcher" "metadata.bundle-pull.svc-watcher"
-#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-metadata" "metadata.bundle-pull.svc-metadata"
-#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-tester" "metadata.bundle-pull.svc-tester"
-#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-authcontroller" "metadata.bundle-pull.svc-authcontroller"
-#add_pull_consumer "METADATA_BUNDLE_PULL" "metadata-bundle-pull-gatekeeper" "metadata.bundle-pull.svc-gatekeeper"
-
 # METADATA_CA_CLIENT consumers (PULL based)
 echo "=== METADATA_CLIENT consumers ==="
-#add_pull_consumer "METADATA_CA_CLIENT" "metadata-client-ca-cert" "metadata.client.ca-cert"
 add_pull_consumer "METADATA_CA_CLIENT" "authcontroller-ca-consumer" "metadata.client.ca-cert"
 add_pull_consumer "METADATA_CA_CLIENT" "gatekeeper-ca-consumer" "metadata.client.ca-cert"
 add_pull_consumer "METADATA_CA_CLIENT" "watcher-ca-consumer" "metadata.client.ca-cert"

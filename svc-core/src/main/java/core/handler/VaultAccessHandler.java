@@ -186,6 +186,17 @@ public class VaultAccessHandler implements AutoCloseable
                    promise.fail(err);
                  });
       }
+      else if("DELETE".equalsIgnoreCase(method)) {
+        webClient.deleteAbs(url)
+                 .putHeader("X-Vault-Token", token)
+                 .as(BodyCodec.string())
+                 .send()
+                 .onSuccess(response -> handleVaultResponse(response, promise))
+                 .onFailure(err -> {
+                   LOGGER.error("Vault DELETE HTTP request failed for url = " + url + "; error = " + err.getMessage());
+                   promise.fail(err);
+                 });
+      }  
       else { // GET and other methods - treated as GET here
         webClient.getAbs(url)
                  .putHeader("X-Vault-Token", token)
@@ -243,7 +254,19 @@ public class VaultAccessHandler implements AutoCloseable
                    promise.fail(err);
                  });
       }
-      else {
+      else if("DELETE".equalsIgnoreCase(method)) {
+        webClient.deleteAbs(url)
+                 .putHeader("X-Vault-Token", token)
+                 .as(BodyCodec.string())
+                 .send()
+                 .onSuccess(response -> handleVaultRawResponse(response, promise))
+                 .onFailure(err -> {
+                   LOGGER.error("Vault DELETE HTTP request failed for url = " + url + "; error = " + err.getMessage());
+                   promise.fail(err);
+                 });
+      }
+      else 
+      {
         webClient.getAbs(url)
                  .putHeader("X-Vault-Token", token)
                  .as(BodyCodec.string())

@@ -587,8 +587,7 @@ public class NatsTLSClient implements CertificateUpdateCallbackIF
 
   /**
    * Try several short flush attempts (ms) - returns true on success.
-   */
-  private boolean tryFlushWithRetries(Connection conn, int[] attemptsMs, Duration fallbackTimeout)
+   private boolean tryFlushWithRetries(Connection conn, int[] attemptsMs, Duration fallbackTimeout)
   {
     if (conn == null) return false;
 
@@ -620,6 +619,7 @@ public class NatsTLSClient implements CertificateUpdateCallbackIF
       return false;
     }
   }
+*/
 
   // ===== SSL CONTEXT AND CERTIFICATE METHODS =====
 

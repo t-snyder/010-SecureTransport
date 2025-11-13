@@ -4,7 +4,7 @@
 # - Creates cert-manager issuers and certificates
 # - Waits for TLS secrets
 # - Patches the openbao-tls secret with expected key names
-# - Deploys OpenBao using Helm or manifests with 3 replicas/raft HA
+# - Deploys OpenBao using Helm with 3 replicas/raft HA
 
 set -e
 

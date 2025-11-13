@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# Step-04 Updated: Configure OpenBao PKI with Secrets Operator Integration
 # Always regenerate CA certificates and store in KV store for cross-cluster sync
 
 set -e

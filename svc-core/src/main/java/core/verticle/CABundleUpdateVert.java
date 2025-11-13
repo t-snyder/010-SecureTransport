@@ -195,22 +195,17 @@ public class CABundleUpdateVert extends AbstractVerticle
         .onSuccess(sub -> 
         {
           this.caSubscription = sub;
-          LOGGER.info("╔═══════════════════════════════════════════════════════════════════╗");
-          LOGGER.info("║ ✅ BOUND TO CA BUNDLE CONSUMER                                    ║");
-          LOGGER.info("║ Service: {}                                              ║", String.format("%-44s", serviceId));
-          LOGGER.info("║ Durable: {}                                      ║", String.format("%-44s", durableName));
-          LOGGER.info("║ Stream: {}                                       ║", String.format("%-45s", STREAM_NAME));
-          LOGGER.info("╚═══════════════════════════════════════════════════════════════════╝");
+          LOGGER.info("══════════════════════════════════════════════════════════════════════════════════════════════════════════");
+          LOGGER.info("✅ BOUND TO CA BUNDLE CONSUMER Service: {}; Durable: {}; Stream: {}", serviceId, durableName, STREAM_NAME);
+          LOGGER.info("══════════════════════════════════════════════════════════════════════════════════════════════════════════");
           promise.complete();
         })
         .onFailure(err -> 
         {
-          LOGGER.error("╔═══════════════════════════════════════════════════════════════════╗");
-          LOGGER.error("║ ❌ FAILED TO BIND CA CONSUMER                                     ║");
-          LOGGER.error("║ Stream: {}                                       ║", String.format("%-45s", STREAM_NAME));
-          LOGGER.error("║ Durable: {}                                      ║", String.format("%-44s", durableName));
-          LOGGER.error("║ Error: {}║", String.format("%-47s", truncate(err.getMessage(), 47)));
-          LOGGER.error("╚═══════════════════════════════════════════════════════════════════╝");
+          LOGGER.error("════════════════════════════════════════════════════════════════════════════════════");
+          LOGGER.error("❌ FAILED TO BIND CA CONSUMER Stream: {}, Durable: {}", STREAM_NAME, durableName);
+          LOGGER.error("   Error: {}║", String.format("%-47s", truncate(err.getMessage(), 47)));
+          LOGGER.error("════════════════════════════════════════════════════════════════════════════════════");
           promise.fail(err);
         });
       });
@@ -433,21 +428,17 @@ public class CABundleUpdateVert extends AbstractVerticle
 
       if (ar.failed())
       {
-        LOGGER.error("╔═══════════════════════════════════════════════════════════════════╗");
-        LOGGER.error("║ ❌ CA BUNDLE ROTATION FAILED                                      ║");
-        LOGGER.error("║ Epoch: {}                                                    ║", String.format("%-50s", epoch));
-        LOGGER.error("║ Duration: {}ms                                              ║", String.format("%-45s", elapsed));
-        LOGGER.error("║ Error: {}║", String.format("%-47s", truncate(ar.cause().getMessage(), 47)));
-        LOGGER.error("╚═══════════════════════════════════════════════════════════════════╝", ar.cause());
+        LOGGER.error("═══════════════════════════════════════════════════════════════════");
+        LOGGER.error("❌ CA BUNDLE ROTATION FAILED Epoch: {}, Duration: {}ms", epoch, elapsed);
+        LOGGER.error("   Error: {}", String.format("%-47s", truncate(ar.cause().getMessage(), 47)));
+        LOGGER.error("═══════════════════════════════════════════════════════════════════", ar.cause());
       }
       else
       {
-        LOGGER.info("╔═══════════════════════════════════════════════════════════════════╗");
-        LOGGER.info("║ ✅ CA ROTATION COMPLETE                                           ║");
-        LOGGER.info("║ Epoch: {}                                                    ║", String.format("%-50s", epoch));
-        LOGGER.info("║ Duration: {}ms                                              ║", String.format("%-45s", elapsed));
-        LOGGER.info("║ New connection active, all pools recreated                        ║");
-        LOGGER.info("╚═══════════════════════════════════════════════════════════════════╝");
+        LOGGER.info("═══════════════════════════════════════════════════════════════════");
+        LOGGER.info("✅ CA ROTATION COMPLETE - Epoch: {}, Overall Duration: {}ms", epoch, elapsed);
+        LOGGER.info("   New connection active, all pools recreated                        ");
+        LOGGER.info("═══════════════════════════════════════════════════════════════════");
       }
 
       // Check for pending rotation

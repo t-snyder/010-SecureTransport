@@ -11,7 +11,7 @@
 #   d) Docker             - 27.2.0
 #   d) Cert-manager       - 1.17.5
 #   e) Istio              - 1.26.1
-#   e) Hashicorp Vault    - 1.19.5
+#   e) OpenBao            - 2.2.0
 #   f) Kubernetes Gateway - 1.2.0
 #   g) OpenSSL            - 3.4.0
 #
