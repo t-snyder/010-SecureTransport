@@ -43,7 +43,7 @@ public class KeySecretManager
 {
   private static final Logger   LOGGER = LoggerFactory.getLogger(KeySecretManager.class.getName());
   private static final Duration KEY_CLEANUP_GRACE_PERIOD   = Duration.ofMinutes(60);
-  private static final int      TOPIC_KEY_RETENTION_EPOCHS = 20;  // Keep 20 epochs (100 minutes)
+  private static final int      TOPIC_KEY_RETENTION_EPOCHS = 10;  // Keep 10 epochs (if epoch 15 minutes = 150 minutes)
 
   private final Vertx vertx;
 
