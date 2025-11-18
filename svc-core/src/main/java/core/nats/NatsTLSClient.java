@@ -114,6 +114,7 @@ public class NatsTLSClient implements CertificateUpdateCallbackIF
   private KubernetesClient kubeClient;
   private String namespace;
 
+
   public NatsTLSClient(Vertx vertx, java.util.Map<String, String> config,
                       KubernetesClient kubeClient, String serviceId, String namespace)
     throws Exception
@@ -420,6 +421,7 @@ public class NatsTLSClient implements CertificateUpdateCallbackIF
       consecutiveRecreateFailures.set(0);
     });
   } 
+
  
   private Future<Void> recreateConnectionWithNewCA()
   {
@@ -526,7 +528,7 @@ public class NatsTLSClient implements CertificateUpdateCallbackIF
       }
     } ).mapEmpty();
   }
-  
+
 
   private void recreatePoolsWithNewConnection(Connection newConnection, long newGeneration)
   {

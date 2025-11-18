@@ -43,6 +43,7 @@ public class NatsProducerPoolManager implements CertificateUpdateCallbackIF
   private static final int MAX_ROTATION_RETRIES = 3;
   private static final long ROTATION_RETRY_DELAY_MS = 200;
 
+
   public NatsProducerPoolManager(Vertx vertx, NatsTLSClient natsTlsClient)
   {
     this.vertx = vertx;

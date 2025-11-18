@@ -215,7 +215,7 @@ public class CaBundleConsumerVert extends AbstractVerticle
           LOGGER.info("📊 CA bundle epoch: {}", epoch);
 
           // Schedule or queue rotation (non-blocking)
-          scheduleOrQueue(epoch, msgBytes);
+          scheduleOrQueueRotation(epoch, msgBytes);
           
           // Complete immediately - rotation happens asynchronously
           promise.complete();
@@ -233,7 +233,7 @@ public class CaBundleConsumerVert extends AbstractVerticle
   /**
    * Schedule or queue rotation based on epoch
    */
-  private void scheduleOrQueue(long epoch, byte[] raw)
+  private void scheduleOrQueueRotation(long epoch, byte[] raw)
   {
     long cur = currentEpoch;
     
@@ -246,11 +246,12 @@ public class CaBundleConsumerVert extends AbstractVerticle
     if (rotationInProgress.compareAndSet(false, true))
     {
       currentEpoch = epoch;
-      LOGGER.info("╔═══════════════════════════════════════════════════════════════════╗");
-      LOGGER.info("║ 🔄 STARTING CA BUNDLE ROTATION                                    ║");
-      LOGGER.info("║ Epoch: {}                                                    ║", String.format("%-50s", epoch));
-      LOGGER.info("║ Status: No active rotation                                        ║");
-      LOGGER.info("╚═══════════════════════════════════════════════════════════════════╝");
+
+      LOGGER.info("═══════════════════════════════════════════════════════════════════");
+      LOGGER.info("🔄 STARTING CA BUNDLE ROTATION  ");
+      LOGGER.info("   Epoch: {}                    ", String.format("%-50s", epoch));
+      LOGGER.info("   Status: No active rotation   ");
+      LOGGER.info("═══════════════════════════════════════════════════════════════════");
       startRotation(epoch, raw);
     }
     else
@@ -300,20 +301,20 @@ public class CaBundleConsumerVert extends AbstractVerticle
       
       if (ar.failed())
       {
-        LOGGER.error("╔═══════════════════════════════════════════════════════════════════╗");
-        LOGGER.error("║ ❌ CA BUNDLE ROTATION FAILED                                      ║");
-        LOGGER.error("║ Epoch: {}                                                    ║", String.format("%-50s", epoch));
-        LOGGER.error("║ Duration: {}ms                                              ║", String.format("%-45s", elapsed));
-        LOGGER.error("║ Error: {}║", String.format("%-47s", truncate(ar.cause().getMessage(), 47)));
-        LOGGER.error("╚═══════════════════════════════════════════════════════════════════╝", ar.cause());
+        LOGGER.error("═══════════════════════════════════════════════════════════════════");
+        LOGGER.error("❌ CA BUNDLE ROTATION FAILED ");
+        LOGGER.error("   Epoch: {}                 ", String.format("%-50s", epoch));
+        LOGGER.error("   Duration: {}ms            ", String.format("%-45s", elapsed));
+        LOGGER.error("   Error: {}║", String.format("%-47s", truncate(ar.cause().getMessage(), 47)));
+        LOGGER.error("═══════════════════════════════════════════════════════════════════", ar.cause());
       }
       else
       {
-        LOGGER.info("╔═══════════════════════════════════════════════════════════════════╗");
-        LOGGER.info("║ ✅ CA ROTATION COMPLETE                                           ║");
-        LOGGER.info("║ Epoch: {}                                                    ║", String.format("%-50s", epoch));
-        LOGGER.info("║ Duration: {}ms                                              ║", String.format("%-45s", elapsed));
-        LOGGER.info("╚═══════════════════════════════════════════════════════════════════╝");
+        LOGGER.info("═══════════════════════════════════════════════════════════════════");
+        LOGGER.info("✅ CA ROTATION COMPLETE ");
+        LOGGER.info("   Epoch: {}            ", String.format("%-50s", epoch));
+        LOGGER.info("   Duration: {}ms       ", String.format("%-45s", elapsed));
+        LOGGER.info("═══════════════════════════════════════════════════════════════════");
       }
       
       // Check for pending rotation
